@@ -15,7 +15,7 @@ AttendanceFlow is a web application for managing classes, student rosters, sched
 The application is designed to exchange enrollment and attendance information with UniEnroll without directly accessing UniEnroll's database. Attendance evidence uses check-in time and optional browser location; photo upload and R2 storage are intentionally not part of the deployed design.
 
 ## 1. Complete & Cloud Deploy
-
+ 
 ### Production components
 
 | Component | Deployment |

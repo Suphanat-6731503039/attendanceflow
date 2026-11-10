@@ -42,10 +42,12 @@ import {
   getPartnerIntegrationStatus,
   getStudentSchedule,
   getWorkspace,
+  joinClass,
   joinWorkspace,
   saveWorkspace,
   setupOwner,
   signIn,
+  startGoogleSignIn,
   signOut,
   submitStudentCheckIn,
   syncPartnerEnrollments,
@@ -53,6 +55,7 @@ import {
   resetStudentPassword,
   registerStudent,
   getStudentRegistrations,
+  createProfessorAccount,
   enrollStudentsInClass,
   uploadClassMaterial,
 } from './lib/cloudAttendanceApi'
@@ -74,6 +77,12 @@ function createId(prefix) {
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
   return `${prefix}-${id}`
+}
+
+function createClassCode() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  const bytes = crypto.getRandomValues(new Uint8Array(8))
+  return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join('')
 }
 
 function initials(name = '') {
@@ -198,6 +207,8 @@ function App() {
   const [statusFilter, setStatusFilter] = useState('all')
   const [studentFilter, setStudentFilter] = useState('active')
   const [studentRegistrations, setStudentRegistrations] = useState([])
+  const [professorError, setProfessorError] = useState('')
+  const [professorBusy, setProfessorBusy] = useState(false)
   const [registrationError, setRegistrationError] = useState('')
   const [enrollmentBusy, setEnrollmentBusy] = useState(false)
   const [showCreateSession, setShowCreateSession] = useState(false)
@@ -353,7 +364,10 @@ function App() {
     savedDataRef.current = workspace.data
     workspaceRevisionRef.current = workspace.revision
     setData(workspace.data)
+    const safeRoute = user.role === 'admin' ? '/admin' : '/professor'
+    window.history.replaceState({}, '', safeRoute)
     setAccount(user)
+    setRoute(safeRoute)
     setStorageError('')
     setSelectedSessionId(workspace.data.sessions.find((session) => session.status === 'open')?.id || workspace.data.sessions[0]?.id || '')
   }
@@ -373,6 +387,11 @@ function App() {
     setStudentSchedule(schedule)
     setData(null)
     setRoute('/student')
+  }
+
+  async function handleJoinClass(classCode, studentCode) {
+    await joinClass(classCode, studentCode)
+    setStudentSchedule(await getStudentSchedule())
   }
 
   async function submitAuth(event) {
@@ -782,6 +801,26 @@ function App() {
     }
   }
 
+  async function handleCreateProfessor(event) {
+    event.preventDefault()
+    setProfessorError('')
+    setProfessorBusy(true)
+    const form = new FormData(event.currentTarget)
+    try {
+      await createProfessorAccount(
+        String(form.get('accountId') || ''),
+        String(form.get('name') || ''),
+        String(form.get('password') || ''),
+      )
+      event.currentTarget.reset()
+      setNotice('Professor account created')
+    } catch (error) {
+      setProfessorError(error.message)
+    } finally {
+      setProfessorBusy(false)
+    }
+  }
+
   function createClass(event) {
     event.preventDefault()
     const form = new FormData(event.currentTarget)
@@ -800,6 +839,7 @@ function App() {
       ...(sectionNumber ? { sectionNumber } : {}),
       room,
       studentIds: [],
+      joinCode: createClassCode(),
       createdBy: account.id,
       createdAt: new Date().toISOString(),
     }
@@ -837,6 +877,7 @@ function App() {
       startTime,
       endTime,
       materials: [],
+      createdBy: account.id,
       createdAt: new Date().toISOString(),
     }
     if (!commitData((current) => ({
@@ -883,6 +924,7 @@ function App() {
     inviteCode={inviteFromUrl}
     onSubmit={submitAuth}
     onModeChange={(mode) => { setAuthMode(mode); setAuthError(''); setAuthBootError('') }}
+    onGoogleSignIn={startGoogleSignIn}
   />
   if (account.role === 'student') {
     if (!studentSchedule) return <div className="auth-loading">Loading your class schedule</div>
@@ -913,6 +955,7 @@ function App() {
           throw error
         }
       }}
+      onJoinClass={handleJoinClass}
     />
   }
   if (!data) return <div className="auth-loading">Loading shared attendance data</div>
@@ -962,7 +1005,7 @@ function App() {
         <header className="topbar">
           <button className="menu-button" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={21} /></button>
           <div className="breadcrumb"><span>AttendanceFlow</span><ChevronRight size={14} /><strong>{currentPage.label}</strong></div>
-          <div className="top-actions"><a className="text-button" href="/professor">Professor view</a><span className="term-label">Cloud · Shared data</span><button className="text-button sign-out-button" onClick={handleSignOut}>Sign out</button><div className="top-avatar">{initials(account.name)}</div></div>
+          <div className="top-actions">{account.role === 'instructor' && <a className="text-button" href="/professor">Professor view</a>}<span className="term-label">Cloud · Shared data</span><button className="text-button sign-out-button" onClick={handleSignOut}>Sign out</button><div className="top-avatar">{initials(account.name)}</div></div>
         </header>
 
         <div className="page-wrap">
@@ -1055,6 +1098,9 @@ function App() {
             inviteCopied={inviteCopied}
             onCreateInvite={createInvite}
             onCopyInvite={copyInvite}
+            onCreateProfessor={handleCreateProfessor}
+            professorError={professorError}
+            professorBusy={professorBusy}
           />}
         </div>
       </main>
@@ -1087,9 +1133,10 @@ function App() {
   )
 }
 
-function StudentPortal({ account, schedule, error, onSignOut, onRefresh, onCheckIn }) {
+function StudentPortal({ account, schedule, error, onSignOut, onRefresh, onCheckIn, onJoinClass }) {
   const [busySessionId, setBusySessionId] = useState('')
   const [formError, setFormError] = useState('')
+  const [joinBusy, setJoinBusy] = useState(false)
   const [clock, setClock] = useState(Date.now())
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 15000)
@@ -1129,6 +1176,21 @@ function StudentPortal({ account, schedule, error, onSignOut, onRefresh, onCheck
     }
   }
 
+  async function submitJoin(event) {
+    event.preventDefault()
+    setFormError('')
+    setJoinBusy(true)
+    const form = new FormData(event.currentTarget)
+    try {
+      await onJoinClass(String(form.get('classCode') || ''), String(form.get('studentCode') || ''))
+      event.currentTarget.reset()
+    } catch (joinError) {
+      setFormError(joinError.message)
+    } finally {
+      setJoinBusy(false)
+    }
+  }
+
   return <div className="portal-shell student-portal">
     <header className="portal-topbar">
       <a className="brand portal-brand" href="/student"><span className="brand-mark"><Check size={17} strokeWidth={3} /></span><span>Attendance<span>Flow</span></span></a>
@@ -1141,6 +1203,7 @@ function StudentPortal({ account, schedule, error, onSignOut, onRefresh, onCheck
       </section>
       {(error || formError) && <div className="portal-alert" role="alert">{formError || error}</div>}
       <section className="portal-notice"><Bell size={18} /><div><strong>{schedule.pending ? 'รอผู้ดูแลจัดเข้าชั้นเรียน' : todaySessions.length ? `วันนี้มีเรียน ${todaySessions.length} วิชา` : 'วันนี้ไม่มีตารางเรียน'}</strong><span>{schedule.pending ? 'เมื่อ Admin เพิ่มคุณเข้าคลาสแล้ว วิชาและเวลาเรียนจะแสดงที่นี่' : todaySessions.length ? 'เช็กชื่อได้ในช่วงเวลาเรียนของแต่ละวิชา โดยต้องอนุญาตตำแหน่งที่ตั้ง' : 'ตรวจสอบกำหนดการเรียนครั้งถัดไปได้ด้านล่าง'}</span></div></section>
+      <section className="portal-section student-join-section"><div className="portal-section-heading"><div><p className="eyebrow">JOIN A CLASS</p><h2>เข้าห้องเรียนด้วยรหัส</h2></div></div><form className="class-code-form" onSubmit={submitJoin}><input name="classCode" required maxLength="32" placeholder="กรอกรหัส Class" aria-label="Class code" /><input name="studentCode" maxLength="100" placeholder="รหัสนักศึกษา (ถ้ามี)" aria-label="Student ID" /><button className="primary-button" type="submit" disabled={joinBusy}>{joinBusy ? 'กำลังเข้าคลาส...' : 'เข้าคลาส'}</button></form></section>
       <section className="portal-section">
         <div className="portal-section-heading"><div><p className="eyebrow">TODAY</p><h2>วิชาที่เรียนวันนี้</h2></div><span className="subtle-label">{todaySessions.length} วิชา</span></div>
         {todaySessions.length ? <div className="portal-class-grid">{todaySessions.map((session) => {
@@ -1250,7 +1313,7 @@ function ProfessorPortal({
   return <div className="portal-shell professor-portal">
     <header className="portal-topbar">
       <a className="brand portal-brand" href="/professor"><span className="brand-mark"><Check size={17} strokeWidth={3} /></span><span>Attendance<span>Flow</span></span></a>
-      <div className="portal-user"><span>{account.name} · อาจารย์</span><a className="text-button" href="/Admin">หน้า Admin</a><button className="outline-button" onClick={onSignOut}>ออกจากระบบ</button></div>
+      <div className="portal-user"><span>{account.name} · อาจารย์</span>{account.role === 'admin' && <a className="text-button" href="/Admin">หน้า Admin</a>}<button className="outline-button" onClick={onSignOut}>ออกจากระบบ</button></div>
     </header>
     <main className="portal-content">
       <section className="portal-welcome">
@@ -1261,7 +1324,7 @@ function ProfessorPortal({
       <section className="portal-section professor-session-section">
         <div className="portal-section-heading"><div><p className="eyebrow">CLASSES AND WEEKLY SESSIONS</p><h2>คลาสเรียน</h2></div><span className="subtle-label">{classes.length} คลาส</span></div>
         {classes.length ? <div className="portal-schedule-list">{classes.map((classroom) => <section className="class-program" key={classroom.id}>
-          <div className="class-program-heading"><div><span className="course-code">{classroom.courseCode}{classroom.sectionNumber ? ` · ${classroom.sectionNumber}` : ''}</span><h3>{classroom.courseName}</h3><span>{classroom.room} · {(classroom.studentIds || []).length} students</span></div><button className="outline-button" onClick={() => { setSelectedClassId(classroom.id); setCourseSessionError(''); setShowCourseSessionForm(true) }}><Plus size={14} /> เพิ่ม session</button></div>
+          <div className="class-program-heading"><div><span className="course-code">{classroom.courseCode}{classroom.sectionNumber ? ` · ${classroom.sectionNumber}` : ''}</span><h3>{classroom.courseName}</h3><span>{classroom.room} · {(classroom.studentIds || []).length} students · Class Code: <strong>{classroom.joinCode || 'ยังไม่มี'}</strong></span></div><button className="outline-button" onClick={() => { setSelectedClassId(classroom.id); setCourseSessionError(''); setShowCourseSessionForm(true) }}><Plus size={14} /> เพิ่ม session</button></div>
           {(courseSessions || []).filter((item) => item.classId === classroom.id).length ? <div className="course-session-list">{courseSessions.filter((item) => item.classId === classroom.id).map((item) => <article className="course-session-block" key={item.id}>
             <div className="course-session-heading"><div><strong>{item.title}</strong><span>{weekDays[item.weekday]} · {item.startTime}–{item.endTime}</span></div><span className="subtle-label">{item.materials.length} materials</span></div>
             {item.materials.map((material) => <div className="course-material-row" key={material.id}><strong>{material.title}</strong>{material.type === 'text' ? <p>{material.text}</p> : material.type === 'link' ? <a href={material.url} target="_blank" rel="noreferrer">{material.url}</a> : material.type === 'image' ? <a href={`/api/class/materials?key=${encodeURIComponent(material.objectKey)}`} target="_blank" rel="noreferrer"><img className="session-material-image" src={`/api/class/materials?key=${encodeURIComponent(material.objectKey)}`} alt={material.title} /></a> : <a href={`/api/class/materials?key=${encodeURIComponent(material.objectKey)}`} target="_blank" rel="noreferrer">{material.fileName}</a>}</div>)}
@@ -1388,7 +1451,7 @@ function SessionMaterialsEditor({ session, onAddMaterial, onUploadMaterial }) {
   </details>
 }
 
-function AuthScreen({ mode, initialized, error, busy, inviteCode = '', onSubmit, onModeChange }) {
+function AuthScreen({ mode, initialized, error, busy, inviteCode = '', onSubmit, onModeChange, onGoogleSignIn }) {
   const isSetup = mode === 'setup'
   const isJoin = mode === 'join'
   const isReset = mode === 'reset'
@@ -1423,6 +1486,7 @@ function AuthScreen({ mode, initialized, error, busy, inviteCode = '', onSubmit,
         {error && <p className="auth-error" role="alert">{error}</p>}
         <button className="primary-button login-button" type="submit" disabled={busy}>{busy ? 'Please wait...' : isSetup ? 'Create workspace' : isJoin ? 'Join workspace' : isReset ? 'Set new password' : 'Sign in'}</button>
       </form>
+      {!isSetup && !isJoin && !isReset && !isStudentSignup && <button className="outline-button login-button" type="button" onClick={onGoogleSignIn}>Continue with Google</button>}
       {!isSetup && !isReset && !isStudentSignup && <button className="demo-button" type="button" onClick={() => onModeChange(isJoin ? 'login' : initialized ? 'join' : 'setup')}>
         {isJoin ? 'Back to sign in' : initialized ? 'Have a team invite? Join workspace' : 'First time here? Set up workspace'}
       </button>}
@@ -1681,10 +1745,11 @@ function ReportsView({ sessions, reportSessionId, onSelect, onExport, onExportSe
   </div>
 }
 
-function SettingsView({ data, error, importInput, onExport, onImport, user, inviteCode, inviteError, inviteCopied, onCreateInvite, onCopyInvite }) {
+function SettingsView({ data, error, importInput, onExport, onImport, user, inviteCode, inviteError, inviteCopied, onCreateInvite, onCopyInvite, onCreateProfessor, professorError, professorBusy }) {
   return <div className="settings-view">
     <section className="panel data-card"><div className="data-card-icon"><ShieldCheck size={19} /></div><div><p className="eyebrow">Where your data lives</p><h2>Shared Cloudflare workspace</h2><p>Attendance records are stored in the dedicated AttendanceFlow database and shared with invited teammates. UniEnroll rosters and attendance events sync through the configured integration</p><div className="data-facts"><span><strong>{data.students.length}</strong> students</span><span><strong>{data.sessions.length}</strong> sessions</span><span><strong>{data.activity?.length || 0}</strong> activity events</span></div></div></section>
     {user.role === 'admin' && <section className="panel backup-panel"><div className="panel-heading"><div><p className="eyebrow">Team access</p><h2>Invite a teammate</h2><p className="panel-subtitle">Create a one-time invitation code for an instructor. It expires after 24 hours</p></div></div><div className="backup-actions"><button className="primary-button" onClick={onCreateInvite}><UserPlus size={15} /> Create invite code</button>{inviteCode && <button className="outline-button" onClick={onCopyInvite}><Copy size={15} /> {inviteCopied ? 'Copied' : 'Copy code'}</button>}</div>{inviteCode && <div className="invite-code" aria-label="One-time invitation code">{inviteCode}</div>}{inviteError && <p className="form-error" role="alert">{inviteError}</p>}</section>}
+    {user.role === 'admin' && <section className="panel backup-panel"><div className="panel-heading"><div><p className="eyebrow">Professor accounts</p><h2>Create professor account</h2><p className="panel-subtitle">Set the professor ID and initial password directly</p></div></div><form className="form-grid" onSubmit={onCreateProfessor}><label>Professor ID<input name="accountId" required placeholder="prof-001" /></label><label>Name<input name="name" required maxLength="160" /></label><label>Password<input name="password" type="password" required minLength="12" /></label><button className="primary-button modal-submit" type="submit" disabled={professorBusy}>{professorBusy ? 'Creating...' : 'Create account'}</button></form>{professorError && <p className="form-error" role="alert">{professorError}</p>}</section>}
     <section className="panel backup-panel"><div className="panel-heading"><div><p className="eyebrow">Portability</p><h2>Backup and restore</h2><p className="panel-subtitle">Backups include the student directory, sessions, rosters and attendance records. Restoring replaces shared data for every teammate</p></div></div><div className="backup-actions"><button className="primary-button" onClick={onExport}><Download size={15} /> Download backup</button><button className="outline-button" onClick={() => importInput.current?.click()}><Upload size={15} /> Restore from backup</button><input ref={importInput} className="sr-only" type="file" accept="application/json,.json" onChange={onImport} /></div>{error && <p className="form-error" role="alert">{error}</p>}</section>
   </div>
 }
