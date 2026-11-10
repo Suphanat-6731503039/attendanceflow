@@ -64,6 +64,10 @@ export function signIn(email, password) {
   return request('/api/auth/login', { method: 'POST', body: { email, password } })
 }
 
+export function startGoogleSignIn() {
+  window.location.assign('/api/auth/google/start')
+}
+
 export function registerStudent(name, studentCode, email, password) {
   return request('/api/auth/student-register', { method: 'POST', body: { name, studentCode, email, password } })
 }
@@ -72,10 +76,24 @@ export function getStudentRegistrations() {
   return request('/api/admin/student-registrations')
 }
 
+export function createProfessorAccount(accountId, name, password) {
+  return request('/api/admin/professors', {
+    method: 'POST',
+    body: { accountId, name, password },
+  })
+}
+
 export function enrollStudentsInClass(classId, studentIds) {
   return request('/api/admin/class-enrollments', {
     method: 'POST',
     body: { classId, studentIds },
+  })
+}
+
+export function joinClass(classCode, studentCode = '') {
+  return request('/api/student/join-class', {
+    method: 'POST',
+    body: { classCode, studentCode },
   })
 }
 

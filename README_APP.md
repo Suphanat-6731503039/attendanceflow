@@ -36,6 +36,8 @@ Configure these as Cloudflare secrets; do not put credentials in source code or 
 - Scheduled Worker `attendanceflow-integration`: `UNIENROLL_WEBHOOK_SECRET`.
 - `UNIENROLL_API_BASE_URL` is optional and defaults to `https://unienroll-backend.team03-enrollment.workers.dev`. If the partner supplies a different base URL, configure the same HTTPS URL for Pages and the scheduled Worker.
 
+Google sign-in requires a Google OAuth Web application with the callback URL `https://<your-pages-domain>/api/auth/google/callback`. Configure `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` as Pages secrets. Google sign-in creates a pending student account when the email is not already linked; the student can then join a class with its Class Code.
+
 Set secret values interactively:
 
 ```bash
@@ -67,10 +69,11 @@ For local Pages emulation, run `npm run pages:dev`. Wrangler emulates the D1 bin
 
 ## Workflows
 
-- Sign in, first-admin setup, one-time instructor invitations, admin-issued student password-reset links, and sign out.
+- Sign in with email/password or Google, first-admin setup, one-time instructor invitations, administrator-created professor IDs, admin-issued student password-reset links, and sign out.
 - Students can register with email and password; their account remains pending until an administrator enrolls it in a class.
 - Shared student directory; sync course rosters from UniEnroll, edit students, or archive them without removing attendance history. Admin class rosters support selecting multiple students at once.
-- Professor portal at `/professor` to create classes and recurring weekly session blocks, attach text, HTTPS links, images, PDFs, or PowerPoint files, and review attendance evidence.
+- Professor portal at `/professor` to create classes and recurring weekly session blocks, share a Class Code, attach text, HTTPS links, images, PDFs, or PowerPoint files, and review attendance evidence.
+- Students can join a class with its Class Code; their schedule remains empty until they join or an administrator enrolls them.
 - Student portal at `/student` to view enrolled classes and upcoming weekly sessions and check in during the scheduled weekday/time with browser location.
 - Create, open, close, reopen, and review class sessions with session-specific roster snapshots.
 - Mark attendance present, late, absent, excused, or unmarked. Closing a session converts unmarked records to absent.
