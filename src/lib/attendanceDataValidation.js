@@ -11,6 +11,10 @@ export function validateData(data) {
   if (!data || data.version !== 1 || !Array.isArray(data.students) || !Array.isArray(data.sessions)) {
     return false
   }
+  const classes = data.classes ?? []
+  const courseSessions = data.courseSessions ?? []
+  if (!Array.isArray(classes) || !Array.isArray(courseSessions)
+    || classes.length > 2000 || courseSessions.length > 10000) return false
 
   const studentIds = new Set()
   const studentCodes = new Set()
@@ -71,6 +75,35 @@ export function validateData(data) {
       if (rosterIds.has(record.studentId)) return false
       rosterIds.add(record.studentId)
     }
+  }
+
+  const classIds = new Set()
+  for (const classroom of classes) {
+    if (!classroom || typeof classroom.id !== 'string' || !classroom.id.trim()
+      || typeof classroom.courseCode !== 'string' || !classroom.courseCode.trim()
+      || typeof classroom.courseName !== 'string' || !classroom.courseName.trim()
+      || typeof classroom.room !== 'string' || !Array.isArray(classroom.studentIds)
+      || classroom.studentIds.some((studentId) => !studentIds.has(studentId))) return false
+    if (classIds.has(classroom.id)) return false
+    classIds.add(classroom.id)
+  }
+
+  const courseSessionIds = new Set()
+  for (const session of courseSessions) {
+    if (!session || typeof session.id !== 'string' || !classIds.has(session.classId)
+      || typeof session.title !== 'string' || !session.title.trim()
+      || !Number.isInteger(session.weekday) || session.weekday < 0 || session.weekday > 6
+      || typeof session.startTime !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(session.startTime)
+      || typeof session.endTime !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(session.endTime)
+      || session.endTime <= session.startTime || !Array.isArray(session.materials)) return false
+    if (courseSessionIds.has(session.id)) return false
+    courseSessionIds.add(session.id)
+    if (session.materials.some((material) => !material || typeof material.id !== 'string'
+      || !['text', 'image', 'slide', 'link'].includes(material.type)
+      || typeof material.title !== 'string'
+      || (material.type === 'text' && (typeof material.text !== 'string' || material.text.length > 20000))
+      || (['image', 'slide'].includes(material.type) && typeof material.objectKey !== 'string')
+      || (material.type === 'link' && (typeof material.url !== 'string' || !/^https:\/\//i.test(material.url))))) return false
   }
 
   if (data.activity !== undefined) {

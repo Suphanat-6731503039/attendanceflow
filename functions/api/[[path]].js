@@ -131,6 +131,10 @@ function validEmail(value) {
 function validateAttendanceData(data) {
   if (!data || data.version !== 1 || !Array.isArray(data.students) || !Array.isArray(data.sessions)) return false
   if (data.students.length > 20000 || data.sessions.length > 10000) return false
+  const classes = data.classes ?? []
+  const courseSessions = data.courseSessions ?? []
+  if (!Array.isArray(classes) || !Array.isArray(courseSessions)
+    || classes.length > 2000 || courseSessions.length > 10000) return false
 
   const studentIds = new Set()
   const studentCodes = new Set()
@@ -181,6 +185,35 @@ function validateAttendanceData(data) {
     }
   }
 
+  const classIds = new Set()
+  for (const classroom of classes) {
+    if (!classroom || typeof classroom.id !== 'string' || !classroom.id.trim()
+      || typeof classroom.courseCode !== 'string' || !classroom.courseCode.trim()
+      || typeof classroom.courseName !== 'string' || !classroom.courseName.trim()
+      || typeof classroom.room !== 'string' || !Array.isArray(classroom.studentIds)
+      || classroom.studentIds.some((studentId) => !studentIds.has(studentId))) return false
+    if (classIds.has(classroom.id)) return false
+    classIds.add(classroom.id)
+  }
+
+  const courseSessionIds = new Set()
+  for (const session of courseSessions) {
+    if (!session || typeof session.id !== 'string' || !classIds.has(session.classId)
+      || typeof session.title !== 'string' || !session.title.trim()
+      || !Number.isInteger(session.weekday) || session.weekday < 0 || session.weekday > 6
+      || typeof session.startTime !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(session.startTime)
+      || typeof session.endTime !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(session.endTime)
+      || session.endTime <= session.startTime || !Array.isArray(session.materials)) return false
+    if (courseSessionIds.has(session.id)) return false
+    courseSessionIds.add(session.id)
+    if (session.materials.some((material) => !material || typeof material.id !== 'string'
+      || !['text', 'image', 'slide', 'link'].includes(material.type)
+      || typeof material.title !== 'string'
+      || (material.type === 'text' && (typeof material.text !== 'string' || material.text.length > 20000))
+      || (['image', 'slide'].includes(material.type) && typeof material.objectKey !== 'string')
+      || (material.type === 'link' && (typeof material.url !== 'string' || !/^https:\/\//i.test(material.url))))) return false
+  }
+
   if (data.activity !== undefined && (!Array.isArray(data.activity) || data.activity.length > 500
     || data.activity.some((event) => !event || typeof event.id !== 'string'
       || typeof event.action !== 'string' || typeof event.detail !== 'string'
@@ -204,7 +237,7 @@ async function getAccount(request, db) {
   if (!token || token.length > 128) return null
   const tokenHash = await hashText(token)
   const result = await db.prepare(`
-    SELECT accounts.id, accounts.email, accounts.full_name, accounts.role, accounts.student_id
+    SELECT accounts.id, accounts.email, accounts.full_name, accounts.role, accounts.student_id, accounts.account_kind
     FROM auth_sessions
     JOIN accounts ON accounts.id = auth_sessions.account_id
     WHERE auth_sessions.token_hash = ? AND auth_sessions.expires_at > ?
@@ -212,13 +245,18 @@ async function getAccount(request, db) {
   return result || null
 }
 
+function isStudentAccount(account) {
+  return account?.account_kind === 'student' || Boolean(account?.student_id)
+}
+
 function publicAccount(account) {
   return {
     id: account.id,
     email: account.email,
     name: account.full_name,
-    role: account.student_id ? 'student' : account.role,
+    role: isStudentAccount(account) ? 'student' : account.role,
     studentId: account.student_id || null,
+    pending: account.account_kind === 'student' && !account.student_id,
   }
 }
 
@@ -237,7 +275,7 @@ async function readWorkspace(db) {
 }
 
 function emptyData() {
-  return { version: 1, students: [], sessions: [], activity: [] }
+  return { version: 1, students: [], sessions: [], classes: [], courseSessions: [], activity: [] }
 }
 
 async function recordLoginFailure(db, email, ipAddress) {
@@ -273,7 +311,7 @@ async function login(request, env) {
   const ipAddress = request.headers.get('CF-Connecting-IP') || ''
   if (await isRateLimited(env.DB, email, ipAddress)) return fail('TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again in 15 minutes', 429)
 
-  const account = await env.DB.prepare('SELECT id, email, full_name, password_salt, password_hash, role, student_id FROM accounts WHERE email = ?')
+  const account = await env.DB.prepare('SELECT id, email, full_name, password_salt, password_hash, role, student_id, account_kind FROM accounts WHERE email = ?')
     .bind(email).first()
   const salt = account?.password_salt || toBase64Url(crypto.getRandomValues(new Uint8Array(16)))
   const computedHash = await derivePasswordHash(body.password, salt)
@@ -287,6 +325,94 @@ async function login(request, env) {
   const ipKey = await hashText(`ip:${ipAddress || 'unknown'}`)
   await env.DB.prepare('DELETE FROM auth_attempts WHERE attempt_key IN (?, ?)').bind(emailKey, ipKey).run()
   return ok({ user: publicAccount(account) }, 200, cookieHeaders(sessionToken, request))
+}
+
+async function registerStudent(request, env) {
+  const body = await readJson(request)
+  if (!validEmail(body.email) || typeof body.name !== 'string' || !body.name.trim() || body.name.trim().length > 160
+    || typeof body.studentCode !== 'string' || !body.studentCode.trim() || body.studentCode.trim().length > 100
+    || typeof body.password !== 'string' || body.password.length < 12 || body.password.length > 128) {
+    return fail('INVALID_REGISTRATION', 'Enter your name, student ID, email, and a password of at least 12 characters')
+  }
+  const email = body.email.trim().toLowerCase()
+  const studentCode = body.studentCode.trim()
+  const ipAddress = request.headers.get('CF-Connecting-IP') || ''
+  if (await isRateLimited(env.DB, email, ipAddress)) return fail('TOO_MANY_ATTEMPTS', 'Too many registration attempts. Try again in 15 minutes', 429)
+  const exists = await env.DB.prepare('SELECT id FROM accounts WHERE email = ?').bind(email).first()
+  if (exists) return fail('ACCOUNT_EXISTS', 'An account already uses this email. Sign in instead', 409)
+
+  const accountId = randomToken(16)
+  const now = new Date().toISOString()
+  const salt = toBase64Url(crypto.getRandomValues(new Uint8Array(16)))
+  const passwordHash = await derivePasswordHash(body.password, salt)
+  try {
+    await env.DB.prepare(`
+      INSERT INTO accounts (id, email, full_name, password_salt, password_hash, role, account_kind, student_code, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'instructor', 'student', ?, ?, ?)
+    `).bind(accountId, email, body.name.trim(), salt, passwordHash, studentCode, now, now).run()
+  } catch (error) {
+    if (error.message.includes('UNIQUE constraint failed')) return fail('ACCOUNT_EXISTS', 'An account already uses this email', 409)
+    throw error
+  }
+  const sessionToken = await createSession(env.DB, accountId)
+  return ok({ user: { id: accountId, email, name: body.name.trim(), role: 'student', studentId: null, pending: true } }, 201, cookieHeaders(sessionToken, request))
+}
+
+async function listStudentRegistrations(env, account) {
+  if (account.role !== 'admin') return fail('FORBIDDEN', 'Only an administrator can review student registrations', 403)
+  const result = await env.DB.prepare(`
+    SELECT id, email, full_name, student_code, created_at
+    FROM accounts WHERE account_kind = 'student' AND student_id IS NULL
+    ORDER BY created_at
+  `).all()
+  return ok(result.results.map((student) => ({
+    id: student.id,
+    email: student.email,
+    name: student.full_name,
+    studentCode: student.student_code,
+    createdAt: student.created_at,
+  })))
+}
+
+async function resetStudentPassword(request, env) {
+  const body = await readJson(request)
+  if (typeof body.resetCode !== 'string' || body.resetCode.length < 24 || body.resetCode.length > 128
+    || typeof body.password !== 'string' || body.password.length < 12 || body.password.length > 128) {
+    return fail('INVALID_PASSWORD_RESET', 'Enter a valid reset link and a password of at least 12 characters')
+  }
+
+  const reset = await env.DB.prepare(`
+    SELECT id, account_id, student_id FROM student_password_resets
+    WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?
+  `).bind(await hashText(body.resetCode), Math.floor(Date.now() / 1000)).first()
+  if (!reset) return fail('INVALID_PASSWORD_RESET', 'This reset link is invalid, expired, or already used', 401)
+
+  const salt = toBase64Url(crypto.getRandomValues(new Uint8Array(16)))
+  const passwordHash = await derivePasswordHash(body.password, salt)
+  const now = new Date().toISOString()
+  const nowEpoch = Math.floor(Date.now() / 1000)
+  const claimId = randomToken(16)
+  const statements = await env.DB.batch([
+    env.DB.prepare(`
+      UPDATE student_password_resets SET used_at = ?, claimed_by = ?
+      WHERE id = ? AND used_at IS NULL AND expires_at > ?
+    `).bind(now, claimId, reset.id, nowEpoch),
+    env.DB.prepare(`
+      UPDATE accounts SET password_salt = ?, password_hash = ?, updated_at = ?
+      WHERE id = ? AND student_id = ? AND EXISTS (
+        SELECT 1 FROM student_password_resets WHERE id = ? AND claimed_by = ? AND used_at = ?
+      )
+    `).bind(salt, passwordHash, now, reset.account_id, reset.student_id, reset.id, claimId, now),
+    env.DB.prepare(`
+      DELETE FROM auth_sessions WHERE account_id = ? AND EXISTS (
+        SELECT 1 FROM student_password_resets WHERE id = ? AND claimed_by = ? AND used_at = ?
+      )
+    `).bind(reset.account_id, reset.id, claimId, now),
+  ])
+  if (Number(statements[0]?.meta?.changes || 0) !== 1 || Number(statements[1]?.meta?.changes || 0) !== 1) {
+    return fail('INVALID_PASSWORD_RESET', 'This reset link is invalid, expired, or already used', 401)
+  }
+  return ok({ passwordReset: true })
 }
 
 async function setupOwner(request, env) {
@@ -393,7 +519,7 @@ async function issueInvite(request, env, account) {
 
 async function issueStudentInvite(request, env, account) {
   const body = await readJson(request)
-  if (account.student_id) return fail('FORBIDDEN', 'Students cannot invite other students', 403)
+  if (isStudentAccount(account)) return fail('FORBIDDEN', 'Students cannot invite other students', 403)
   if (typeof body.studentId !== 'string' || typeof body.sessionId !== 'string') {
     return fail('INVALID_INVITATION', 'Choose a student and class session')
   }
@@ -404,12 +530,179 @@ async function issueStudentInvite(request, env, account) {
     return fail('STUDENT_NOT_ENROLLED', 'The student is not on this class roster', 404)
   }
   const linkedAccount = await env.DB.prepare('SELECT id FROM accounts WHERE student_id = ?').bind(student.id).first()
-  if (linkedAccount) return fail('STUDENT_ALREADY_REGISTERED', 'This student already has an account', 409)
+  if (linkedAccount) {
+    if (account.role !== 'admin') return fail('STUDENT_ALREADY_REGISTERED', 'This student already has an account', 409)
+    const resetCode = randomToken(24)
+    const now = new Date().toISOString()
+    const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60 * 24
+    await env.DB.batch([
+      env.DB.prepare('UPDATE student_password_resets SET used_at = ? WHERE account_id = ? AND used_at IS NULL')
+        .bind(now, linkedAccount.id),
+      env.DB.prepare(`
+        INSERT INTO student_password_resets (id, token_hash, account_id, student_id, created_by, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(randomToken(16), await hashText(resetCode), linkedAccount.id, student.id, account.id, now, expiresAt),
+    ])
+    return ok({ code: resetCode, type: 'reset', expiresAt: new Date(expiresAt * 1000).toISOString() }, 201)
+  }
   const code = randomToken(24)
   const now = new Date().toISOString()
   await env.DB.prepare("INSERT INTO invitations (id, token_hash, created_by, expires_at, created_at, role, student_id, session_id) VALUES (?, ?, ?, ?, ?, 'student', ?, ?)")
     .bind(randomToken(16), await hashText(code), account.id, Math.floor(Date.now() / 1000) + 60 * 60 * 24, now, student.id, session.id).run()
-  return ok({ code, expiresAt: new Date(Date.now() + 86400000).toISOString() }, 201)
+  return ok({ code, type: 'invite', expiresAt: new Date(Date.now() + 86400000).toISOString() }, 201)
+}
+
+async function enrollStudentsInClass(request, env, account) {
+  if (account.role !== 'admin') return fail('FORBIDDEN', 'Only an administrator can enroll students in a class', 403)
+  const body = await readJson(request)
+  const selectedIds = Array.isArray(body.studentIds) ? [...new Set(body.studentIds)] : []
+  if (typeof body.classId !== 'string' || !selectedIds.length || selectedIds.length > 500
+    || selectedIds.some((id) => typeof id !== 'string' || id.length > 128)) {
+    return fail('INVALID_ENROLLMENT', 'Choose a class and at least one student')
+  }
+  const workspace = await readWorkspace(env.DB)
+  const classroom = workspace?.data.classes?.find((item) => item.id === body.classId)
+  if (!workspace || !classroom) return fail('CLASS_NOT_FOUND', 'This class could not be found', 404)
+
+  const currentStudents = workspace.data.students
+  const selectedDirectoryStudents = selectedIds.filter((id) => currentStudents.some((student) => student.id === id && student.active))
+  const registrationIds = selectedIds.filter((id) => !selectedDirectoryStudents.includes(id))
+  let registrations = []
+  if (registrationIds.length) {
+    const placeholders = registrationIds.map(() => '?').join(', ')
+    const result = await env.DB.prepare(`
+      SELECT id, email, full_name, student_code FROM accounts
+      WHERE id IN (${placeholders}) AND account_kind = 'student' AND student_id IS NULL
+    `).bind(...registrationIds).all()
+    registrations = result.results
+    if (registrations.length !== registrationIds.length) return fail('REGISTRATION_NOT_FOUND', 'A selected student registration is no longer available', 409)
+  }
+
+  const knownCodes = new Map(currentStudents.map((student) => [student.code.trim().toLowerCase(), student]))
+  const newlyCreatedStudents = []
+  const accountLinks = []
+  for (const registration of registrations) {
+    const normalizedCode = registration.student_code.trim().toLowerCase()
+    const matchingStudent = knownCodes.get(normalizedCode)
+    if (matchingStudent) {
+      if (matchingStudent.email && matchingStudent.email.trim().toLowerCase() !== registration.email) {
+        return fail('STUDENT_CODE_CONFLICT', `Student ID ${registration.student_code} is already assigned to another email`, 409)
+      }
+      accountLinks.push({ accountId: registration.id, studentId: matchingStudent.id })
+      if (!matchingStudent.email) matchingStudent.email = registration.email
+      continue
+    }
+    const student = {
+      id: createId('student'),
+      code: registration.student_code,
+      name: registration.full_name,
+      email: registration.email,
+      active: true,
+      createdAt: new Date().toISOString(),
+    }
+    knownCodes.set(normalizedCode, student)
+    newlyCreatedStudents.push(student)
+    accountLinks.push({ accountId: registration.id, studentId: student.id })
+  }
+
+  const studentIds = [...new Set([...classroom.studentIds, ...selectedDirectoryStudents, ...accountLinks.map((link) => link.studentId)])]
+  const updatedData = {
+    ...workspace.data,
+    students: [...currentStudents.filter((student) => !newlyCreatedStudents.some((newStudent) => newStudent.id === student.id)), ...newlyCreatedStudents],
+    classes: workspace.data.classes.map((item) => item.id === classroom.id ? { ...item, studentIds } : item),
+    activity: [
+      { id: createId('activity'), action: 'class.students_enrolled', detail: `${selectedIds.length} students added to ${classroom.courseCode}`, createdAt: new Date().toISOString() },
+      ...(Array.isArray(workspace.data.activity) ? workspace.data.activity : []),
+    ].slice(0, 500),
+  }
+  if (!validateAttendanceData(updatedData)) return fail('INVALID_DATA', 'The class enrollment data is invalid')
+
+  const updatedAt = new Date().toISOString()
+  const serializedData = JSON.stringify(updatedData)
+  const accountGuard = registrationIds.length
+    ? `AND NOT EXISTS (SELECT 1 FROM accounts WHERE id IN (${registrationIds.map(() => '?').join(', ')}) AND (account_kind != 'student' OR student_id IS NOT NULL))`
+    : ''
+  const statements = [env.DB.prepare(`
+    UPDATE attendance_workspace SET data_json = ?, revision = revision + 1, updated_at = ?, updated_by = ?
+    WHERE id = 'shared' AND revision = ? ${accountGuard}
+  `).bind(serializedData, updatedAt, account.id, workspace.revision, ...registrationIds)]
+  for (const link of accountLinks) {
+    statements.push(env.DB.prepare(`
+      UPDATE accounts SET student_id = ?, student_code = NULL, updated_at = ?
+      WHERE id = ? AND account_kind = 'student' AND student_id IS NULL
+        AND EXISTS (SELECT 1 FROM attendance_workspace WHERE revision = ? AND updated_by = ? AND data_json = ?)
+    `).bind(link.studentId, updatedAt, link.accountId, workspace.revision + 1, account.id, serializedData))
+  }
+  const results = await env.DB.batch(statements)
+  if (Number(results[0]?.meta?.changes || 0) !== 1
+    || results.slice(1).some((result) => Number(result?.meta?.changes || 0) !== 1)) {
+    return fail('WORKSPACE_CONFLICT', 'The workspace changed while enrolling students. Refresh and try again', 409)
+  }
+  return ok({ studentCount: selectedIds.length }, 200)
+}
+
+async function uploadClassMaterial(request, env, account) {
+  if (isStudentAccount(account)) return fail('FORBIDDEN', 'Only professors and administrators can upload class materials', 403)
+  if (!env.MATERIALS) return fail('STORAGE_NOT_CONFIGURED', 'Class material storage is not configured', 503)
+  const contentLength = Number(request.headers.get('Content-Length') || 0)
+  if (contentLength > 11 * 1024 * 1024) return fail('MATERIAL_TOO_LARGE', 'Uploads must be 10 MB or smaller', 413)
+  const form = await request.formData()
+  const sessionId = String(form.get('sessionId') || '')
+  const title = String(form.get('title') || '').trim()
+  const file = form.get('file')
+  if (!sessionId || !title || title.length > 160 || !file || typeof file.stream !== 'function') {
+    return fail('INVALID_MATERIAL', 'Choose a session, title, and file')
+  }
+  if (file.size < 1 || file.size > 10 * 1024 * 1024) return fail('MATERIAL_TOO_LARGE', 'Materials must be 10 MB or smaller', 413)
+  const isImage = new Set(['image/avif', 'image/gif', 'image/jpeg', 'image/png', 'image/webp']).has(file.type)
+  const isSlide = file.type === 'application/pdf'
+    || file.type === 'application/vnd.ms-powerpoint'
+    || file.type === 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+  if (!isImage && !isSlide) return fail('UNSUPPORTED_MATERIAL', 'Upload an image, PDF, or PowerPoint file')
+  const workspace = await readWorkspace(env.DB)
+  if (!workspace?.data.courseSessions?.some((item) => item.id === sessionId)) {
+    return fail('SESSION_NOT_FOUND', 'This course session could not be found', 404)
+  }
+  const objectKey = `class-materials/${sessionId}/${randomToken(24)}`
+  await env.MATERIALS.put(objectKey, file.stream(), {
+    httpMetadata: { contentType: file.type || 'application/octet-stream' },
+  })
+  return ok({
+    objectKey,
+    fileName: file.name.slice(0, 180),
+    contentType: file.type,
+    type: isImage ? 'image' : 'slide',
+    title,
+  }, 201)
+}
+
+async function serveClassMaterial(request, env, account) {
+  if (!env.MATERIALS) return fail('STORAGE_NOT_CONFIGURED', 'Class material storage is not configured', 503)
+  const url = new URL(request.url)
+  const objectKey = url.searchParams.get('key') || ''
+  if (!objectKey || objectKey.length > 300 || !objectKey.startsWith('class-materials/')) {
+    return fail('INVALID_MATERIAL', 'A valid material key is required')
+  }
+  const workspace = await readWorkspace(env.DB)
+  const containingSession = workspace?.data.courseSessions?.find((session) =>
+    session.materials.some((material) => material.objectKey === objectKey))
+  if (!containingSession) return fail('MATERIAL_NOT_FOUND', 'This material is no longer available', 404)
+  const material = containingSession.materials.find((item) => item.objectKey === objectKey)
+  if (isStudentAccount(account)) {
+    if (!account.student_id) return fail('FORBIDDEN', 'Your student account is waiting for class enrollment', 403)
+    const classroom = workspace.data.classes.find((item) => item.id === containingSession.classId)
+    if (!classroom?.studentIds.includes(account.student_id)) return fail('FORBIDDEN', 'This material is not available to your account', 403)
+  }
+  const object = await env.MATERIALS.get(objectKey)
+  if (!object) return fail('MATERIAL_NOT_FOUND', 'This material is no longer available', 404)
+  return new Response(object.body, {
+    headers: {
+      'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream',
+      'Content-Disposition': material.type === 'image' ? 'inline' : 'attachment',
+      'Cache-Control': 'private, max-age=60',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  })
 }
 
 function bangkokDateTime(date = new Date()) {
@@ -426,8 +719,17 @@ function bangkokDateTime(date = new Date()) {
   return { date: `${values.year}-${values.month}-${values.day}`, time: `${values.hour}:${values.minute}` }
 }
 
+function addDaysToDate(date, offset) {
+  const value = new Date(`${date}T00:00:00Z`)
+  value.setUTCDate(value.getUTCDate() + offset)
+  return value.toISOString().slice(0, 10)
+}
+
 async function getStudentSchedule(env, account) {
-  if (!account.student_id) return fail('FORBIDDEN', 'A student account is required', 403)
+  if (!account.student_id) {
+    if (account.account_kind === 'student') return ok({ student: null, classes: [], courseSessions: [], sessions: [], pending: true })
+    return fail('FORBIDDEN', 'A student account is required', 403)
+  }
   const workspace = await readWorkspace(env.DB)
   if (!workspace) return fail('WORKSPACE_NOT_INITIALIZED', 'The attendance workspace has not been initialized', 503)
   const student = workspace.data.students.find((item) => item.id === account.student_id)
@@ -438,7 +740,41 @@ async function getStudentSchedule(env, account) {
       ...session,
       roster: session.roster.filter((record) => record.studentId === student.id),
     }))
-  return ok({ student, sessions })
+  const classes = (workspace.data.classes || [])
+    .filter((classroom) => classroom.studentIds.includes(student.id))
+    .map(({ studentIds, ...classroom }) => classroom)
+  const classIds = new Set(classes.map((classroom) => classroom.id))
+  const courseSessions = (workspace.data.courseSessions || []).filter((item) => classIds.has(item.classId))
+  const scheduleSessions = []
+  for (let offset = 0; offset < 14; offset += 1) {
+    const date = addDaysToDate(bangkokDateTime().date, offset)
+    const weekday = new Date(`${date}T12:00:00Z`).getUTCDay()
+    for (const courseSession of courseSessions.filter((item) => item.weekday === weekday)) {
+      const classroom = classes.find((item) => item.id === courseSession.classId)
+      if (!classroom) continue
+      const occurrenceId = `weekly:${courseSession.id}:${date}`
+      const record = sessions.find((item) => item.courseSessionId === courseSession.id && item.date === date)
+      scheduleSessions.push(record || {
+        id: occurrenceId,
+        courseSessionId: courseSession.id,
+        classId: classroom.id,
+        courseCode: classroom.courseCode,
+        courseName: classroom.courseName,
+        sectionNumber: classroom.sectionNumber,
+        title: courseSession.title,
+        room: classroom.room,
+        date,
+        startTime: courseSession.startTime,
+        endTime: courseSession.endTime,
+        status: 'scheduled',
+        materials: courseSession.materials,
+        roster: [{ studentId: student.id, studentCode: student.code, studentName: student.name, status: 'unmarked', markedAt: null }],
+      })
+    }
+  }
+  const scheduledSessionIds = new Set(scheduleSessions.map((session) => session.id))
+  const legacySessions = sessions.filter((session) => !scheduledSessionIds.has(session.id))
+  return ok({ student, classes, courseSessions, sessions: [...legacySessions, ...scheduleSessions], pending: classes.length === 0 })
 }
 
 async function studentCheckIn(request, env, account, context) {
@@ -474,9 +810,38 @@ async function studentCheckIn(request, env, account, context) {
     }
     return jsonResponse(JSON.parse(previous.response_json), previous.status_code, { 'X-Idempotent-Replay': 'true' })
   }
-  const session = workspace.data.sessions.find((item) => item.id === body.sessionId)
+  let baseData = workspace.data
+  let session = baseData.sessions.find((item) => item.id === body.sessionId)
+  if (!session) {
+    const now = bangkokDateTime()
+    const courseSession = baseData.courseSessions?.find((item) => body.sessionId === `weekly:${item.id}:${now.date}`)
+    const classroom = courseSession && baseData.classes?.find((item) => item.id === courseSession.classId)
+    const weekday = new Date(`${now.date}T12:00:00Z`).getUTCDay()
+    if (courseSession && classroom?.studentIds.includes(account.student_id) && courseSession.weekday === weekday) {
+      session = {
+        id: body.sessionId,
+        courseSessionId: courseSession.id,
+        classId: classroom.id,
+        courseCode: classroom.courseCode,
+        courseName: classroom.courseName,
+        sectionNumber: classroom.sectionNumber,
+        title: courseSession.title,
+        room: classroom.room,
+        date: now.date,
+        startTime: courseSession.startTime,
+        endTime: courseSession.endTime,
+        status: 'open',
+        materials: courseSession.materials,
+        roster: classroom.studentIds.map((studentId) => {
+          const rosterStudent = baseData.students.find((item) => item.id === studentId)
+          return rosterStudent && { studentId, studentCode: rosterStudent.code, studentName: rosterStudent.name, status: 'unmarked', markedAt: null }
+        }).filter(Boolean),
+      }
+      baseData = { ...baseData, sessions: [...baseData.sessions, session] }
+    }
+  }
   const record = session?.roster.find((item) => item.studentId === account.student_id)
-  const student = workspace.data.students.find((item) => item.id === account.student_id && item.active)
+  const student = baseData.students.find((item) => item.id === account.student_id && item.active)
   if (!session || !record || !student) return fail('SESSION_NOT_FOUND', 'This class is not on your schedule', 404)
   const now = bangkokDateTime()
   if (session.status === 'closed' || session.date !== now.date || now.time < session.startTime || now.time >= session.endTime) {
@@ -487,8 +852,8 @@ async function studentCheckIn(request, env, account, context) {
   const eventId = crypto.randomUUID()
   const updatedAt = new Date().toISOString()
   const updatedData = {
-    ...workspace.data,
-    sessions: workspace.data.sessions.map((item) => item.id !== session.id ? item : {
+    ...baseData,
+    sessions: baseData.sessions.map((item) => item.id !== session.id ? item : {
       ...item,
       roster: item.roster.map((entry) => entry.studentId !== account.student_id ? entry : {
         ...entry,
@@ -575,7 +940,7 @@ async function studentCheckIn(request, env, account, context) {
 }
 
 async function partnerEnrollmentProxy(request, env, account) {
-  if (account.student_id) return fail('FORBIDDEN', 'Only instructors can access enrollment rosters', 403)
+  if (isStudentAccount(account)) return fail('FORBIDDEN', 'Only instructors can access enrollment rosters', 403)
   const url = new URL(request.url)
   const courseCode = String(url.searchParams.get('course_code') || '').trim().toUpperCase()
   const sectionNumber = String(url.searchParams.get('section_number') || '').trim()
@@ -594,7 +959,7 @@ async function partnerEnrollmentProxy(request, env, account) {
 }
 
 async function syncPartnerRoster(request, env, account) {
-  if (account.student_id) return fail('FORBIDDEN', 'Only instructors can sync enrollment rosters', 403)
+  if (isStudentAccount(account)) return fail('FORBIDDEN', 'Only instructors can sync enrollment rosters', 403)
   const body = await readJson(request)
   if (typeof body.sessionId !== 'string' || body.sessionId.length > 120) {
     return fail('INVALID_REQUEST', 'A valid class session is required')
@@ -636,7 +1001,7 @@ async function syncPartnerRoster(request, env, account) {
 }
 
 async function partnerIntegrationStatus(env, account) {
-  if (account.student_id) return fail('FORBIDDEN', 'Only instructors can view integration status', 403)
+  if (isStudentAccount(account)) return fail('FORBIDDEN', 'Only instructors can view integration status', 403)
   const [outbox, inbox, reconciliation, failedOutbox, failedInbox] = await Promise.all([
     env.DB.prepare("SELECT status, COUNT(*) AS count FROM webhook_outbox GROUP BY status").all(),
     env.DB.prepare("SELECT status, COUNT(*) AS count FROM webhook_inbox GROUP BY status").all(),
@@ -659,7 +1024,7 @@ async function partnerIntegrationStatus(env, account) {
 }
 
 async function retryReconciliation(request, env, account, context) {
-  if (account.student_id) return fail('FORBIDDEN', 'Only instructors can retry reconciliation', 403)
+  if (isStudentAccount(account)) return fail('FORBIDDEN', 'Only instructors can retry reconciliation', 403)
   const body = await readJson(request)
   if (typeof body.eventId !== 'string' || body.eventId.length > 128) {
     return fail('INVALID_REQUEST', 'A valid eventId is required')
@@ -731,6 +1096,8 @@ export async function onRequest({ request, env, ...context }) {
     if (path === '/api/auth/setup' && method === 'POST') return await setupOwner(request, env)
     if (path === '/api/auth/login' && method === 'POST') return await login(request, env)
     if (path === '/api/auth/join' && method === 'POST') return await joinWorkspace(request, env)
+    if (path === '/api/auth/student-password-reset' && method === 'POST') return await resetStudentPassword(request, env)
+    if (path === '/api/auth/student-register' && method === 'POST') return await registerStudent(request, env)
 
     const account = await getAccount(request, env.DB)
     if (path === '/api/auth/session' && method === 'GET') {
@@ -747,6 +1114,10 @@ export async function onRequest({ request, env, ...context }) {
 
     if (!account) return fail('UNAUTHENTICATED', 'Please sign in to continue', 401)
 
+    if (path === '/api/admin/student-registrations' && method === 'GET') return await listStudentRegistrations(env, account)
+    if (path === '/api/admin/class-enrollments' && method === 'POST') return await enrollStudentsInClass(request, env, account)
+    if (path === '/api/class/materials' && method === 'POST') return await uploadClassMaterial(request, env, account)
+    if (path === '/api/class/materials' && method === 'GET') return await serveClassMaterial(request, env, account)
     if (path === '/api/auth/invitations' && method === 'POST') return await issueInvite(request, env, account)
     if (path === '/api/auth/student-invitations' && method === 'POST') return await issueStudentInvite(request, env, account)
     if (path === '/api/student/data' && method === 'GET') return await getStudentSchedule(env, account)
@@ -757,14 +1128,14 @@ export async function onRequest({ request, env, ...context }) {
     if (path === '/api/partner/reconciliation/retry' && method === 'POST') return await retryReconciliation(request, env, account, context)
 
     if (path === '/api/data' && method === 'GET') {
-      if (account.student_id) return fail('FORBIDDEN', 'Student accounts can only access their own schedule', 403)
+      if (isStudentAccount(account)) return fail('FORBIDDEN', 'Student accounts can only access their own schedule', 403)
       const workspace = await readWorkspace(env.DB)
       if (!workspace) return fail('WORKSPACE_NOT_INITIALIZED', 'The attendance workspace has not been initialized', 503)
       return ok(workspace)
     }
 
     if (path === '/api/data' && method === 'PUT') {
-      if (account.student_id) return fail('FORBIDDEN', 'Student accounts cannot edit the shared workspace', 403)
+      if (isStudentAccount(account)) return fail('FORBIDDEN', 'Student accounts cannot edit the shared workspace', 403)
       const body = await readJson(request)
       if (!Number.isInteger(body.revision) || body.revision < 1 || !validateAttendanceData(body.data)) {
         return fail('INVALID_DATA', 'The attendance data is invalid and was not saved')

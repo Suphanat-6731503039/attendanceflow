@@ -7,3 +7,7 @@ binding = "DB"
 database_name = "attendanceflow-app"
 database_id = "3eabf5d5-1412-4dd3-966d-1e220e2d49ef"
 migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "MATERIALS"
+bucket_name = "attendanceflow-materials"

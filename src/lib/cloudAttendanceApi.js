@@ -64,12 +64,48 @@ export function signIn(email, password) {
   return request('/api/auth/login', { method: 'POST', body: { email, password } })
 }
 
+export function registerStudent(name, studentCode, email, password) {
+  return request('/api/auth/student-register', { method: 'POST', body: { name, studentCode, email, password } })
+}
+
+export function getStudentRegistrations() {
+  return request('/api/admin/student-registrations')
+}
+
+export function enrollStudentsInClass(classId, studentIds) {
+  return request('/api/admin/class-enrollments', {
+    method: 'POST',
+    body: { classId, studentIds },
+  })
+}
+
+export async function uploadClassMaterial(sessionId, title, file) {
+  const form = new FormData()
+  form.set('sessionId', sessionId)
+  form.set('title', title)
+  form.set('file', file)
+  const response = await fetch('/api/class/materials', {
+    method: 'POST',
+    credentials: 'same-origin',
+    body: form,
+  })
+  const payload = await response.json()
+  if (!response.ok || payload.success !== true) {
+    throw new Error(payload.error?.message || `Upload failed (${response.status})`)
+  }
+  return payload.data
+}
+
 export function setupOwner(setupCode, name, email, password) {
   return request('/api/auth/setup', { method: 'POST', body: { setupCode, name, email, password } })
 }
 
 export function joinWorkspace(inviteCode, name, email, password) {
   return request('/api/auth/join', { method: 'POST', body: { inviteCode, name, email, password } })
+}
+
+export function resetStudentPassword(resetCode, password) {
+  return request('/api/auth/student-password-reset', { method: 'POST', body: { resetCode, password } })
 }
 
 export function signOut() {

@@ -13,19 +13,20 @@ The Vite server serves the frontend only. Cloud-backed authentication and attend
 
 ## Cloudflare setup and deploy
 
-The Pages project is `attendanceflow` at [https://attendanceflow.pages.dev](https://attendanceflow.pages.dev). The D1 database `attendanceflow-app` is dedicated to this app and is separate from the existing Enrollment database.
+The Pages project is `attendanceflow` at [https://attendanceflow.pages.dev](https://attendanceflow.pages.dev). The D1 database `attendanceflow-app` is dedicated to this app and is separate from the existing Enrollment database. Class images and slide files are stored in the `attendanceflow-materials` R2 bucket.
 
 The Cloudflare Pages Functions are in `functions/api`. The durable webhook retry worker is deployed separately from `worker/partner-dispatcher.js`.
 
-Apply the app's D1 schema before deploying:
+Create the materials bucket and apply the app's D1 schema before deploying:
 
 ```bash
+npx wrangler r2 bucket create attendanceflow-materials
 npx wrangler d1 migrations apply attendanceflow-app --remote
 npm run pages:deploy
 npm run integrations:deploy
 ```
 
-D1 migrations add student-linked accounts, class-specific invitations, durable webhook inbox/outbox, request idempotency, and reconciliation records. Attendance check-in stores timestamp and location only; no photo-storage service or R2 bucket is required.
+D1 migrations add student-linked accounts, class-specific invitations, durable webhook inbox/outbox, request idempotency, and reconciliation records. Attendance check-in stores timestamp and location only; R2 is used only for instructor-provided class materials.
 
 ### UniEnroll integration
 
@@ -60,14 +61,17 @@ Configure UniEnroll to send enrollment webhooks to `https://<your-pages-domain>/
 
 The login screen does not ask for a setup code. If no account exists yet, choose **First time here? Set up workspace** to open the separate first-administrator setup screen. The administrator needs a one-time setup code created by the deployment operator. The code is stored in D1 as a SHA-256 hash and expires; it is consumed when the first account is created. The administrator can then create 24-hour, one-time invite codes for instructors from **Data & backup**. New accounts require a password of at least 12 characters.
 
+When a student already has a linked account but cannot sign in, an administrator can use **Professor view** to generate a single-use password-reset link from that student's class roster. The student opens the link and sets a new password; the link expires after 24 hours, and existing sessions for that student are revoked. The application does not send the link by email, so the administrator must share it directly.
+
 For local Pages emulation, run `npm run pages:dev`. Wrangler emulates the D1 binding locally; configure a local D1 database and an unused setup token before testing first-time setup. Never use production student data in an unprotected local environment.
 
 ## Workflows
 
-- Sign in, first-admin setup, one-time instructor invitations, and sign out.
-- Shared student directory; sync course rosters from UniEnroll, edit students, or archive them without removing attendance history.
-- Professor portal at `/professor` to create scheduled classes, select the class roster, issue student-specific invitations, and review attendance evidence.
-- Student portal at `/student` to view the linked student's class schedule and check in only during today's scheduled class time with browser location.
+- Sign in, first-admin setup, one-time instructor invitations, admin-issued student password-reset links, and sign out.
+- Students can register with email and password; their account remains pending until an administrator enrolls it in a class.
+- Shared student directory; sync course rosters from UniEnroll, edit students, or archive them without removing attendance history. Admin class rosters support selecting multiple students at once.
+- Professor portal at `/professor` to create classes and recurring weekly session blocks, attach text, HTTPS links, images, PDFs, or PowerPoint files, and review attendance evidence.
+- Student portal at `/student` to view enrolled classes and upcoming weekly sessions and check in during the scheduled weekday/time with browser location.
 - Create, open, close, reopen, and review class sessions with session-specific roster snapshots.
 - Mark attendance present, late, absent, excused, or unmarked. Closing a session converts unmarked records to absent.
 - Search and filter records, review historical reports, and export CSV.

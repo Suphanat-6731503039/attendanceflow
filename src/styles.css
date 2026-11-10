@@ -488,6 +488,32 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .professor-stats span { color: var(--muted); font-size: 9px; }
 .professor-stats strong { margin-top: 4px; font-size: 20px; }
 .professor-class-summary { display: flex; align-items: center; gap: 13px; padding: 14px; border: 1px solid #ece9e2; border-radius: 9px; background: #fbfaf6; }
+.class-program { padding: 17px 0; border-top: 1px solid var(--line); }
+.class-program-heading, .course-session-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.class-program-heading h3 { margin: 5px 0; font-size: 15px; }
+.class-program-heading > div > span:last-child, .course-session-heading span { color: var(--muted); font-size: 9px; }
+.course-session-list { margin-top: 12px; }
+.course-session-block { padding: 12px 0; border-top: 1px solid var(--line); }
+.course-session-heading strong, .course-session-heading span { display: block; }
+.course-session-heading strong { color: var(--ink); font-size: 11px; }
+.course-material-row { margin-top: 9px; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.course-material-row strong { display: block; color: var(--ink); font-size: 9px; }
+.course-material-row p { margin: 3px 0; white-space: pre-wrap; }
+.course-material-row a { color: #4b7560; overflow-wrap: anywhere; }
+.session-material-image { display: block; max-width: min(420px, 100%); max-height: 300px; margin-top: 5px; object-fit: contain; object-position: left; }
+.session-material-editor { margin-top: 10px; border-top: 1px dashed var(--line); color: var(--ink); }
+.session-material-editor summary { display: flex; align-items: center; gap: 6px; padding: 10px 0; color: #52775b; font-size: 9px; cursor: pointer; }
+.session-material-editor form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; max-width: 720px; padding-bottom: 10px; }
+.session-material-editor label { display: grid; gap: 5px; color: var(--muted); font-size: 9px; }
+.session-material-editor label:nth-child(2), .session-material-editor label:nth-child(3), .session-material-editor label:nth-child(4), .session-material-editor .form-error { grid-column: 1 / -1; }
+.session-material-editor input, .session-material-editor select, .session-material-editor textarea { width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--paper); font: inherit; }
+.session-material-editor textarea { resize: vertical; }
+.session-material-editor .outline-button { justify-self: start; }
+.session-topic-title { margin: -5px 0 10px; color: #4b7560; font-size: 10px; }
+.student-session-materials { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
+.enrollment-row { grid-template-columns: minmax(150px, 1.2fr) minmax(90px, .7fr) minmax(150px, 1fr) minmax(110px, .7fr); }
+.enrollment-student { display: flex; align-items: center; gap: 9px; }
+.enrollment-row input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--coral); }
 .professor-class-summary > div:nth-child(2) { min-width: 0; flex: 1; }
 .professor-class-summary h3 { margin: 5px 0; font-size: 13px; }
 .professor-class-summary > div:nth-child(2) > span:last-child { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 9px; }
@@ -554,6 +580,10 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .professor-class-summary > div:nth-child(2) { flex-basis: calc(100% - 55px); }
   .professor-class-summary > .status-badge { margin-left: 2px; }
   .professor-class-summary > .outline-button { margin-left: auto; }
+  .session-material-editor form { grid-template-columns: minmax(0, 1fr); }
+  .session-material-editor label:nth-child(2), .session-material-editor label:nth-child(3), .session-material-editor label:nth-child(4), .session-material-editor .form-error { grid-column: 1; }
+  .enrollment-row { grid-template-columns: minmax(0, 1fr) minmax(70px, .7fr); }
+  .enrollment-row > span:nth-child(3), .enrollment-row > span:nth-child(4) { display: none; }
   .professor-row-actions { flex-wrap: wrap; }
   .invite-result { align-items: flex-start; flex-direction: column; }
   .invite-result .outline-button { width: 100%; }

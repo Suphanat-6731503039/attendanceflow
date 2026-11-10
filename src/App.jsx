@@ -50,10 +50,16 @@ import {
   submitStudentCheckIn,
   syncPartnerEnrollments,
   retryPartnerReconciliation,
+  resetStudentPassword,
+  registerStudent,
+  getStudentRegistrations,
+  enrollStudentsInClass,
+  uploadClassMaterial,
 } from './lib/cloudAttendanceApi'
 
 const pageDetails = {
   overview: { label: 'Overview', title: 'Good morning, Araya', subtitle: 'Here is your attendance snapshot' },
+  classes: { label: 'Classes', title: 'Class enrollment', subtitle: 'Review student accounts and manage class rosters' },
   sessions: { label: 'Class sessions', title: 'Class sessions', subtitle: 'Create sessions and manage their independent rosters' },
   attendance: { label: 'Attendance roster', title: 'Attendance roster', subtitle: 'Record attendance for one class session at a time' },
   students: { label: 'Students', title: 'Student directory', subtitle: 'Manage student records synced from UniEnroll' },
@@ -170,7 +176,10 @@ function App() {
   const writingRef = useRef(false)
   const pendingNoticeRef = useRef('')
   const [account, setAccount] = useState(null)
-  const [authMode, setAuthMode] = useState(() => new URLSearchParams(window.location.search).has('invite') ? 'join' : 'login')
+  const [authMode, setAuthMode] = useState(() => {
+    if (new URLSearchParams(window.location.hash.slice(1)).has('reset')) return 'reset'
+    return new URLSearchParams(window.location.search).has('invite') ? 'join' : 'login'
+  })
   const [workspaceInitialized, setWorkspaceInitialized] = useState(true)
   const [authLoading, setAuthLoading] = useState(true)
   const [authBusy, setAuthBusy] = useState(false)
@@ -188,6 +197,9 @@ function App() {
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
   const [studentFilter, setStudentFilter] = useState('active')
+  const [studentRegistrations, setStudentRegistrations] = useState([])
+  const [registrationError, setRegistrationError] = useState('')
+  const [enrollmentBusy, setEnrollmentBusy] = useState(false)
   const [showCreateSession, setShowCreateSession] = useState(false)
   const [studentEditor, setStudentEditor] = useState(null)
   const [sessionError, setSessionError] = useState('')
@@ -199,6 +211,7 @@ function App() {
   const [partnerSyncing, setPartnerSyncing] = useState(false)
   const importInput = useRef(null)
   const inviteFromUrl = new URLSearchParams(window.location.search).get('invite') || ''
+  const resetCodeFromUrl = new URLSearchParams(window.location.hash.slice(1)).get('reset') || ''
 
   const sessions = data?.sessions || []
   const students = data?.students || []
@@ -233,11 +246,24 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (view !== 'classes' || account?.role !== 'admin') return undefined
+    let active = true
+    getStudentRegistrations()
+      .then((registrations) => { if (active) setStudentRegistrations(registrations) })
+      .catch((error) => { if (active) setRegistrationError(error.message) })
+    return () => { active = false }
+  }, [account, view])
+
+  useEffect(() => {
     let active = true
     async function initialize() {
       try {
         const status = await getAuthStatus()
         if (active) setWorkspaceInitialized(status.initialized)
+        if (resetCodeFromUrl) {
+          if (active) setAuthMode('reset')
+          return
+        }
         if (!status.initialized) {
           if (active) setAuthMode('login')
           return
@@ -275,6 +301,19 @@ function App() {
     initialize()
     return () => { active = false }
   }, [])
+
+  useEffect(() => {
+    if (account?.role !== 'student') return undefined
+    const interval = window.setInterval(async () => {
+      try {
+        setStudentSchedule(await getStudentSchedule())
+        setPortalError('')
+      } catch (error) {
+        setPortalError(`Could not refresh your schedule: ${error.message}`)
+      }
+    }, 30000)
+    return () => window.clearInterval(interval)
+  }, [account])
 
   useEffect(() => {
     if (!account || !data) return undefined
@@ -345,6 +384,20 @@ function App() {
     const email = String(form.get('email') || '').trim()
     const password = String(form.get('password') || '')
     try {
+      if (authMode === 'reset') {
+        await resetStudentPassword(resetCodeFromUrl, password)
+        window.history.replaceState({}, '', '/student')
+        setAuthMode('login')
+        setNotice('Password updated. Sign in with your new password')
+        return
+      }
+      if (authMode === 'studentSignup') {
+        const result = await registerStudent(name, String(form.get('studentCode') || '').trim(), email, password)
+        await loadStudent(result.user)
+        setAuthMode('login')
+        setAuthBootError('')
+        return
+      }
       let result
       if (authMode === 'setup') {
         result = await setupOwner(String(form.get('setupCode') || '').trim(), name, email, password)
@@ -708,6 +761,110 @@ function App() {
     }
   }
 
+  async function enrollClassStudents(classId, studentIds) {
+    setEnrollmentBusy(true)
+    setRegistrationError('')
+    try {
+      await enrollStudentsInClass(classId, studentIds)
+      const workspace = await getWorkspace()
+      dataRef.current = workspace.data
+      savedDataRef.current = workspace.data
+      workspaceRevisionRef.current = workspace.revision
+      setData(workspace.data)
+      setStudentRegistrations(await getStudentRegistrations())
+      setNotice(`${studentIds.length} students added to the class`)
+      return true
+    } catch (error) {
+      setRegistrationError(error.message)
+      return false
+    } finally {
+      setEnrollmentBusy(false)
+    }
+  }
+
+  function createClass(event) {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    const courseCode = String(form.get('courseCode') || '').trim().toUpperCase()
+    const courseName = String(form.get('courseName') || '').trim()
+    const room = String(form.get('room') || '').trim()
+    const sectionNumber = String(form.get('sectionNumber') || '').trim()
+    if (!courseCode || !courseName || !room) {
+      setSessionError('Enter the course code, course name, and room')
+      return null
+    }
+    const classroom = {
+      id: createId('class'),
+      courseCode,
+      courseName,
+      ...(sectionNumber ? { sectionNumber } : {}),
+      room,
+      studentIds: [],
+      createdBy: account.id,
+      createdAt: new Date().toISOString(),
+    }
+    if (!commitData((current) => ({
+      ...current,
+      classes: [...(current.classes || []), classroom],
+      activity: recordActivity(current, 'class.created', `${courseCode} · ${courseName}`),
+    }), `${courseCode} class created`)) return null
+    setSessionError('')
+    return classroom.id
+  }
+
+  function createCourseSession(event) {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    const classId = String(form.get('classId') || '')
+    const title = String(form.get('title') || '').trim()
+    const weekday = Number(form.get('weekday'))
+    const startTime = String(form.get('startTime') || '')
+    const endTime = String(form.get('endTime') || '')
+    const classroom = data.classes?.find((item) => item.id === classId)
+    if (!classroom || !title || !Number.isInteger(weekday)) {
+      setSessionError('Choose a class, session title, and weekday')
+      return null
+    }
+    if (endTime <= startTime) {
+      setSessionError('End time must be later than the start time')
+      return null
+    }
+    const courseSession = {
+      id: createId('course-session'),
+      classId,
+      title,
+      weekday,
+      startTime,
+      endTime,
+      materials: [],
+      createdAt: new Date().toISOString(),
+    }
+    if (!commitData((current) => ({
+      ...current,
+      courseSessions: [...(current.courseSessions || []), courseSession],
+      activity: recordActivity(current, 'course_session.created', `${classroom.courseCode} · ${title}`),
+    }), `${title} session created`)) return null
+    setSessionError('')
+    return courseSession.id
+  }
+
+  function addCourseMaterial(courseSessionId, material) {
+    const saved = commitData((current) => ({
+      ...current,
+      courseSessions: current.courseSessions.map((item) => item.id !== courseSessionId
+        ? item
+        : { ...item, materials: [...item.materials, material] }),
+      activity: recordActivity(current, 'course_session.material_added', material.title),
+    }), `${material.title} attached`)
+    return saved
+  }
+
+  async function uploadCourseMaterial(courseSessionId, title, file) {
+    const uploaded = await uploadClassMaterial(courseSessionId, title, file)
+    const saved = addCourseMaterial(courseSessionId, { id: createId('material'), ...uploaded })
+    if (!saved) throw new Error('The file uploaded but could not be attached. Try again or remove the unused file from storage.')
+  }
+
   async function copyInvite() {
     try {
       await navigator.clipboard.writeText(inviteCode)
@@ -764,18 +921,19 @@ function App() {
     account={account}
     sessions={sessions}
     students={activeStudents}
+    classes={data.classes || []}
+    courseSessions={data.courseSessions || []}
     onSignOut={handleSignOut}
-    onCreateSession={() => { setSessionError(''); setShowCreateSession(true) }}
+    onCreateClass={createClass}
+    onCreateCourseSession={createCourseSession}
+    onAddMaterial={addCourseMaterial}
+    onUploadMaterial={uploadCourseMaterial}
     onToggleSession={toggleSession}
     onInviteStudent={createStudentInvite}
     onSyncPartner={syncPartnerRoster}
     partnerSyncing={partnerSyncing}
     inviteError={portalError}
     storageError={storageError}
-    showCreateSession={showCreateSession}
-    sessionError={sessionError}
-    onSubmitSession={createSession}
-    onCloseCreateSession={() => setShowCreateSession(false)}
   />
 
   return (
@@ -787,6 +945,7 @@ function App() {
         <p className="nav-label">WORKSPACE</p>
         <nav aria-label="Main navigation">
           <NavButton icon={<LayoutDashboard size={18} />} active={view === 'overview'} onClick={() => { setView('overview'); setMobileNav(false) }}>Overview</NavButton>
+          {account.role === 'admin' && <NavButton icon={<Users size={18} />} active={view === 'classes'} onClick={() => { setView('classes'); setMobileNav(false) }}>Classes</NavButton>}
           <NavButton icon={<CalendarDays size={18} />} active={view === 'sessions'} onClick={() => { setView('sessions'); setMobileNav(false) }}>Class sessions</NavButton>
           <NavButton icon={<Users size={18} />} active={view === 'attendance'} onClick={() => { setView('attendance'); setMobileNav(false) }}>Attendance</NavButton>
           <NavButton icon={<UserPlus size={18} />} active={view === 'students'} onClick={() => { setView('students'); setMobileNav(false) }}>Students</NavButton>
@@ -867,6 +1026,14 @@ function App() {
             onAdd={() => { setStudentError(''); setStudentEditor({}) }}
             onEdit={(student) => { setStudentError(''); setStudentEditor(student) }}
             onArchive={archiveStudent}
+          />}
+          {view === 'classes' && account.role === 'admin' && <ClassesView
+            classes={data.classes || []}
+            students={activeStudents}
+            registrations={studentRegistrations}
+            error={registrationError}
+            busy={enrollmentBusy}
+            onEnroll={enrollClassStudents}
           />}
           {view === 'reports' && <ReportsView
             sessions={sessions}
@@ -969,11 +1136,11 @@ function StudentPortal({ account, schedule, error, onSignOut, onRefresh, onCheck
     </header>
     <main className="portal-content">
       <section className="portal-welcome">
-        <div><p className="eyebrow">{dateLabel}</p><h1>สวัสดี, {schedule.student.name}</h1><p>รหัสนักศึกษา {schedule.student.code} · ตรวจสอบตารางเรียนและเช็กชื่อของคุณ</p></div>
+        <div><p className="eyebrow">{dateLabel}</p><h1>สวัสดี, {schedule.student?.name || account.name}</h1><p>{schedule.student ? `รหัสนักศึกษา ${schedule.student.code} · ตรวจสอบตารางเรียนและเช็กชื่อของคุณ` : 'บัญชีของคุณยังรอผู้ดูแลเพิ่มเข้าชั้นเรียน'}</p></div>
         <button className="outline-button" onClick={onRefresh}><Navigation size={15} /> รีเฟรชตาราง</button>
       </section>
       {(error || formError) && <div className="portal-alert" role="alert">{formError || error}</div>}
-      <section className="portal-notice"><Bell size={18} /><div><strong>{todaySessions.length ? `วันนี้มีเรียน ${todaySessions.length} วิชา` : 'วันนี้ไม่มีตารางเรียน'}</strong><span>{todaySessions.length ? 'เช็กชื่อได้ในช่วงเวลาเรียนของแต่ละวิชา โดยต้องอนุญาตตำแหน่งที่ตั้ง' : 'ตรวจสอบกำหนดการเรียนครั้งถัดไปได้ด้านล่าง'}</span></div></section>
+      <section className="portal-notice"><Bell size={18} /><div><strong>{schedule.pending ? 'รอผู้ดูแลจัดเข้าชั้นเรียน' : todaySessions.length ? `วันนี้มีเรียน ${todaySessions.length} วิชา` : 'วันนี้ไม่มีตารางเรียน'}</strong><span>{schedule.pending ? 'เมื่อ Admin เพิ่มคุณเข้าคลาสแล้ว วิชาและเวลาเรียนจะแสดงที่นี่' : todaySessions.length ? 'เช็กชื่อได้ในช่วงเวลาเรียนของแต่ละวิชา โดยต้องอนุญาตตำแหน่งที่ตั้ง' : 'ตรวจสอบกำหนดการเรียนครั้งถัดไปได้ด้านล่าง'}</span></div></section>
       <section className="portal-section">
         <div className="portal-section-heading"><div><p className="eyebrow">TODAY</p><h2>วิชาที่เรียนวันนี้</h2></div><span className="subtle-label">{todaySessions.length} วิชา</span></div>
         {todaySessions.length ? <div className="portal-class-grid">{todaySessions.map((session) => {
@@ -982,8 +1149,10 @@ function StudentPortal({ account, schedule, error, onSignOut, onRefresh, onCheck
           return <article className="portal-class-card" key={session.id}>
             <div className="portal-class-top"><span className="course-code">{session.courseCode}</span><StatusBadge status={record?.status === 'present' || record?.status === 'late' ? 'present' : open ? 'open' : session.status === 'closed' ? 'absent' : 'upcoming'} label={record?.status === 'present' || record?.status === 'late' ? 'เช็กชื่อแล้ว' : open ? 'เปิดเช็กชื่อ' : session.status === 'closed' ? 'ปิดเช็กชื่อ' : 'ยังไม่ถึงเวลา'} /></div>
             <h3>{session.courseName}</h3>
+            {session.title && <p className="session-topic-title">{session.title}</p>}
             <p className="portal-class-meta"><Clock3 size={15} /> {session.startTime}–{session.endTime}</p>
             <p className="portal-class-meta"><MapPin size={15} /> {session.room}</p>
+            {session.materials?.length > 0 && <div className="student-session-materials">{session.materials.map((material) => <div className="course-material-row" key={material.id}><strong>{material.title}</strong>{material.type === 'text' ? <p>{material.text}</p> : material.type === 'link' ? <a href={material.url} target="_blank" rel="noreferrer">เปิดลิงก์</a> : material.type === 'image' ? <a href={`/api/class/materials?key=${encodeURIComponent(material.objectKey)}`} target="_blank" rel="noreferrer"><img className="session-material-image" src={`/api/class/materials?key=${encodeURIComponent(material.objectKey)}`} alt={material.title} /></a> : <a href={`/api/class/materials?key=${encodeURIComponent(material.objectKey)}`} target="_blank" rel="noreferrer">เปิดสไลด์</a>}</div>)}</div>}
             {record?.status === 'present' || record?.status === 'late'
               ? <div className="checkin-success"><Check size={16} /> เช็กชื่อแล้วเวลา {record.markedAt || '—'}</div>
               : open ? <div className="student-checkin">
@@ -1010,27 +1179,51 @@ function ProfessorPortal({
   account,
   sessions,
   students,
+  classes,
+  courseSessions,
   onSignOut,
-  onCreateSession,
+  onCreateClass,
+  onCreateCourseSession,
+  onAddMaterial,
+  onUploadMaterial,
   onToggleSession,
   onInviteStudent,
   onSyncPartner,
   partnerSyncing,
   inviteError,
   storageError,
-  showCreateSession,
-  sessionError,
-  onSubmitSession,
-  onCloseCreateSession,
 }) {
   const [selectedSessionId, setSelectedSessionId] = useState('')
   const [detailRecord, setDetailRecord] = useState(null)
   const [invite, setInvite] = useState(null)
   const [inviteBusyId, setInviteBusyId] = useState('')
   const [copyMessage, setCopyMessage] = useState('')
+  const [showClassForm, setShowClassForm] = useState(false)
+  const [showCourseSessionForm, setShowCourseSessionForm] = useState(false)
+  const [selectedClassId, setSelectedClassId] = useState(classes[0]?.id || '')
+  const [classFormError, setClassFormError] = useState('')
+  const [courseSessionError, setCourseSessionError] = useState('')
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) || sessions[0]
   const sortedSessions = [...sessions].sort((a, b) => `${b.date}${b.startTime}`.localeCompare(`${a.date}${a.startTime}`))
   const checkInCount = selectedSession?.roster.filter((record) => record.status === 'present' || record.status === 'late').length || 0
+  const weekDays = ['วันอาทิตย์', 'วันจันทร์', 'วันอังคาร', 'วันพุธ', 'วันพฤหัสบดี', 'วันศุกร์', 'วันเสาร์']
+
+  function submitClass(event) {
+    const newClassId = onCreateClass(event)
+    if (newClassId) {
+      setSelectedClassId(newClassId)
+      setShowClassForm(false)
+      setClassFormError('')
+    }
+  }
+
+  function submitCourseSession(event) {
+    const createdId = onCreateCourseSession(event)
+    if (createdId) {
+      setShowCourseSessionForm(false)
+      setCourseSessionError('')
+    }
+  }
 
   async function createInviteFor(record) {
     setInviteBusyId(record.studentId)
@@ -1044,8 +1237,11 @@ function ProfessorPortal({
   async function copyStudentLink() {
     if (!invite) return
     try {
-      await navigator.clipboard.writeText(`${window.location.origin}/student?invite=${encodeURIComponent(invite.code)}`)
-      setCopyMessage('คัดลอกลิงก์คำเชิญแล้ว')
+      const link = invite.type === 'reset'
+        ? `${window.location.origin}/student#reset=${encodeURIComponent(invite.code)}`
+        : `${window.location.origin}/student?invite=${encodeURIComponent(invite.code)}`
+      await navigator.clipboard.writeText(link)
+      setCopyMessage(invite.type === 'reset' ? 'คัดลอกลิงก์ตั้งรหัสผ่านแล้ว' : 'คัดลอกลิงก์คำเชิญแล้ว')
     } catch (error) {
       setCopyMessage(`คัดลอกลิงก์ไม่สำเร็จ: ${error.message}`)
     }
@@ -1059,9 +1255,20 @@ function ProfessorPortal({
     <main className="portal-content">
       <section className="portal-welcome">
         <div><p className="eyebrow">PROFESSOR WORKSPACE</p><h1>จัดการชั้นเรียน</h1><p>สร้างคลาส เชิญนักศึกษา และตรวจสอบหลักฐานการเข้าเรียน</p></div>
-        <button className="primary-button" onClick={onCreateSession}><Plus size={16} /> สร้างชั้นเรียน</button>
+        <div className="backup-actions"><button className="outline-button" onClick={() => { setCourseSessionError(''); setShowCourseSessionForm(true) }} disabled={!classes.length}><Plus size={16} /> สร้าง session</button><button className="primary-button" onClick={() => { setClassFormError(''); setShowClassForm(true) }}><Plus size={16} /> สร้างคลาส</button></div>
       </section>
       {(storageError || inviteError) && <div className="portal-alert" role="alert">{storageError || inviteError}</div>}
+      <section className="portal-section professor-session-section">
+        <div className="portal-section-heading"><div><p className="eyebrow">CLASSES AND WEEKLY SESSIONS</p><h2>คลาสเรียน</h2></div><span className="subtle-label">{classes.length} คลาส</span></div>
+        {classes.length ? <div className="portal-schedule-list">{classes.map((classroom) => <section className="class-program" key={classroom.id}>
+          <div className="class-program-heading"><div><span className="course-code">{classroom.courseCode}{classroom.sectionNumber ? ` · ${classroom.sectionNumber}` : ''}</span><h3>{classroom.courseName}</h3><span>{classroom.room} · {(classroom.studentIds || []).length} students</span></div><button className="outline-button" onClick={() => { setSelectedClassId(classroom.id); setCourseSessionError(''); setShowCourseSessionForm(true) }}><Plus size={14} /> เพิ่ม session</button></div>
+          {(courseSessions || []).filter((item) => item.classId === classroom.id).length ? <div className="course-session-list">{courseSessions.filter((item) => item.classId === classroom.id).map((item) => <article className="course-session-block" key={item.id}>
+            <div className="course-session-heading"><div><strong>{item.title}</strong><span>{weekDays[item.weekday]} · {item.startTime}–{item.endTime}</span></div><span className="subtle-label">{item.materials.length} materials</span></div>
+            {item.materials.map((material) => <div className="course-material-row" key={material.id}><strong>{material.title}</strong>{material.type === 'text' ? <p>{material.text}</p> : material.type === 'link' ? <a href={material.url} target="_blank" rel="noreferrer">{material.url}</a> : material.type === 'image' ? <a href={`/api/class/materials?key=${encodeURIComponent(material.objectKey)}`} target="_blank" rel="noreferrer"><img className="session-material-image" src={`/api/class/materials?key=${encodeURIComponent(material.objectKey)}`} alt={material.title} /></a> : <a href={`/api/class/materials?key=${encodeURIComponent(material.objectKey)}`} target="_blank" rel="noreferrer">{material.fileName}</a>}</div>)}
+            <SessionMaterialsEditor session={item} onAddMaterial={onAddMaterial} onUploadMaterial={onUploadMaterial} />
+          </article>)}</div> : <div className="portal-empty compact-empty"><span>ยังไม่มี session ประจำสัปดาห์ในคลาสนี้</span></div>}
+        </section>)}</div> : <div className="portal-empty"><BookOpen size={23} /><strong>ยังไม่มีคลาส</strong><span>สร้างคลาสก่อน แล้วเพิ่ม session รายสัปดาห์โดยไม่ต้องกำหนดนักเรียนหรือวันที่</span></div>}
+      </section>
       <section className="professor-stats">
         <div><CalendarDays size={18} /><span>ชั้นเรียนทั้งหมด</span><strong>{sessions.length}</strong></div>
         <div><Users size={18} /><span>นักศึกษาในคลาสที่เลือก</span><strong>{selectedSession?.roster.length || 0}</strong></div>
@@ -1077,12 +1284,12 @@ function ProfessorPortal({
               <div className="student-cell"><div className={`student-avatar avatar-${initials(record.studentName).charAt(0).toLowerCase()}`}>{initials(record.studentName)}</div><div><strong>{record.studentName}</strong><small>{record.studentCode}</small></div></div>
               <span className="time-cell">{record.markedAt || '—'}</span>
               <StatusBadge status={record.status} label={record.status === 'present' ? 'เข้าเรียน' : record.status === 'late' ? 'มาสาย' : record.status === 'absent' ? 'ขาดเรียน' : record.status === 'excused' ? 'ลา' : 'ยังไม่เช็กชื่อ'} />
-              <div className="professor-row-actions"><button className="outline-button" onClick={() => setDetailRecord(record)}>เช็ครายละเอียด</button><button className="text-button" disabled={inviteBusyId === record.studentId} onClick={() => createInviteFor(record)}><UserPlus size={14} />{inviteBusyId === record.studentId ? 'กำลังสร้าง...' : 'เชิญนักศึกษา'}</button></div>
+              <div className="professor-row-actions"><button className="outline-button" onClick={() => setDetailRecord(record)}>เช็ครายละเอียด</button><button className="text-button" disabled={inviteBusyId === record.studentId} onClick={() => createInviteFor(record)}><UserPlus size={14} />{inviteBusyId === record.studentId ? 'กำลังสร้าง...' : account.role === 'admin' ? 'เชิญ / รีเซ็ตรหัส' : 'เชิญนักศึกษา'}</button></div>
             </div>)}
             {!selectedSession.roster.length && <div className="portal-empty compact-empty"><span>ยังไม่มีนักศึกษาในชั้นเรียนนี้</span></div>}
           </div>
-          {invite && <div className="invite-result"><div><strong>คำเชิญสำหรับ {invite.studentName}</strong><span>ลิงก์นี้ใช้ได้ครั้งเดียวและหมดอายุใน 24 ชั่วโมง</span><code>{window.location.origin}/student?invite={invite.code}</code></div><button className="outline-button" onClick={copyStudentLink}><Copy size={14} /> คัดลอกลิงก์</button>{copyMessage && <small>{copyMessage}</small>}</div>}
-        </> : <div className="portal-empty"><CalendarDays size={23} /><strong>ยังไม่มีชั้นเรียน</strong><span>สร้างชั้นเรียนแรกเพื่อกำหนดวัน เวลา และเชิญนักศึกษา</span><button className="primary-button" onClick={onCreateSession}><Plus size={15} /> สร้างชั้นเรียน</button></div>}
+          {invite && <div className="invite-result"><div><strong>{invite.type === 'reset' ? 'ลิงก์ตั้งรหัสผ่านใหม่สำหรับ' : 'คำเชิญสำหรับ'} {invite.studentName}</strong><span>ลิงก์นี้ใช้ได้ครั้งเดียวและหมดอายุใน 24 ชั่วโมง</span><code>{invite.type === 'reset' ? `${window.location.origin}/student#reset=${invite.code}` : `${window.location.origin}/student?invite=${invite.code}`}</code></div><button className="outline-button" onClick={copyStudentLink}><Copy size={14} /> คัดลอกลิงก์</button>{copyMessage && <small>{copyMessage}</small>}</div>}
+        </> : <div className="portal-empty"><CalendarDays size={23} /><strong>ยังไม่มี attendance session</strong><span>สร้างคลาสและ session ประจำสัปดาห์ด้านบน แล้วเพิ่มนักศึกษาผ่านหน้า Admin</span></div>}
       </section>
       <section className="portal-section">
         <div className="portal-section-heading"><div><p className="eyebrow">ALL CLASSES</p><h2>ตารางคลาสทั้งหมด</h2></div><span className="subtle-label">{sessions.length} คลาส</span></div>
@@ -1101,33 +1308,101 @@ function ProfessorPortal({
         {detailRecord.checkInLocation && <a className="text-button map-link" href={`https://www.google.com/maps?q=${detailRecord.checkInLocation.latitude},${detailRecord.checkInLocation.longitude}`} target="_blank" rel="noreferrer"><Navigation size={14} /> เปิดแผนที่</a>}
       </div>
     </Modal>}
-    {showCreateSession && <Modal title="สร้างชั้นเรียน" eyebrow="CLASS SETUP" onClose={onCloseCreateSession}>
-      <p className="modal-description">กำหนดวัน เวลา สถานที่ และเลือกนักศึกษาที่เชิญเข้าเรียน</p>
-      <form onSubmit={(event) => {
-        const createdSessionId = onSubmitSession(event)
-        if (createdSessionId) setSelectedSessionId(createdSessionId)
-      }}>
-        <div className="form-grid"><label>รหัสวิชา<input name="courseCode" required maxLength="20" placeholder="เช่น CS204" /></label><label>Section <span className="optional-label">ไม่บังคับ</span><input name="sectionNumber" maxLength="40" placeholder="เช่น SEC01" /></label></div>
-        <label>ห้องเรียน<input name="room" required maxLength="60" placeholder="เช่น อาคาร A ห้อง 301" /></label>
-        <label>ชื่อวิชา<input name="courseName" required maxLength="100" placeholder="ชื่อวิชา" /></label>
-        <div className="form-grid"><label>วันที่เรียน<input name="date" type="date" required defaultValue={localDate()} /></label><label>นักศึกษาเข้าเรียน<select name="studentIds" multiple required size={4} defaultValue={students.map((student) => student.id)}>{students.map((student) => <option key={student.id} value={student.id}>{student.code} · {student.name}</option>)}</select><small className="field-hint">กด Ctrl/Command เพื่อเลือกนักศึกษาหลายคน</small></label></div>
-        <div className="form-grid"><label>เวลาเริ่ม<input name="startTime" type="time" required defaultValue="09:00" /></label><label>เวลาสิ้นสุด<input name="endTime" type="time" required defaultValue="10:30" /></label></div>
-        {sessionError && <p className="form-error" role="alert">{sessionError}</p>}
-        <button className="primary-button modal-submit" type="submit"><Plus size={15} /> บันทึกชั้นเรียน</button>
+    {showClassForm && <Modal title="สร้างคลาส" eyebrow="CLASS SETUP" onClose={() => setShowClassForm(false)}>
+      <p className="modal-description">กำหนดข้อมูลคลาสก่อนเพิ่ม session และให้นักศึกษาเข้าเรียน</p>
+      <form onSubmit={submitClass}>
+        <div className="form-grid"><label>รหัสวิชา<input name="courseCode" required maxLength="30" placeholder="เช่น CS204" /></label><label>Section <span className="optional-label">ไม่บังคับ</span><input name="sectionNumber" maxLength="40" placeholder="เช่น SEC01" /></label></div>
+        <label>ชื่อวิชา<input name="courseName" required maxLength="160" placeholder="ชื่อวิชา" /></label>
+        <label>ห้องเรียน<input name="room" required maxLength="100" placeholder="เช่น อาคาร A ห้อง 301" /></label>
+        {classFormError && <p className="form-error" role="alert">{classFormError}</p>}
+        <button className="primary-button modal-submit" type="submit"><Plus size={15} /> บันทึกคลาส</button>
+      </form>
+    </Modal>}
+    {showCourseSessionForm && <Modal title="เพิ่ม session รายสัปดาห์" eyebrow="SESSION BLOCK" onClose={() => setShowCourseSessionForm(false)}>
+      <form onSubmit={submitCourseSession}>
+        <label>คลาส<select name="classId" required value={selectedClassId} onChange={(event) => setSelectedClassId(event.target.value)}>{classes.map((item) => <option key={item.id} value={item.id}>{item.courseCode} · {item.courseName}</option>)}</select></label>
+        <label>หัวข้อ session<input name="title" required maxLength="160" placeholder="เช่น บทที่ 1: Introduction" /></label>
+        <div className="form-grid"><label>วันเรียนประจำสัปดาห์<select name="weekday" defaultValue="1">{weekDays.map((day, index) => <option key={day} value={index}>{day}</option>)}</select></label><label>เริ่ม<input name="startTime" type="time" required defaultValue="09:00" /></label></div>
+        <label>สิ้นสุด<input name="endTime" type="time" required defaultValue="10:30" /></label>
+        {courseSessionError && <p className="form-error" role="alert">{courseSessionError}</p>}
+        <button className="primary-button modal-submit" type="submit"><Plus size={15} /> บันทึก session</button>
       </form>
     </Modal>}
   </div>
 }
 
+function SessionMaterialsEditor({ session, onAddMaterial, onUploadMaterial }) {
+  const [type, setType] = useState('text')
+  const [title, setTitle] = useState('')
+  const [text, setText] = useState('')
+  const [url, setUrl] = useState('')
+  const [file, setFile] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  async function submit(event) {
+    event.preventDefault()
+    setError('')
+    const materialTitle = title.trim()
+    if (!materialTitle) return setError('Enter a title for this material')
+    setBusy(true)
+    try {
+      if (type === 'text') {
+        if (!text.trim()) throw new Error('Enter the session text')
+        if (!onAddMaterial(session.id, { id: createId('material'), type, title: materialTitle, text: text.trim() })) {
+          throw new Error('The material could not be saved')
+        }
+        setText('')
+      } else if (type === 'link') {
+        let parsedUrl
+        try { parsedUrl = new URL(url) } catch { throw new Error('Enter a valid HTTPS link') }
+        if (parsedUrl.protocol !== 'https:') throw new Error('Links must use HTTPS')
+        if (!onAddMaterial(session.id, { id: createId('material'), type, title: materialTitle, url: parsedUrl.toString() })) {
+          throw new Error('The material could not be saved')
+        }
+        setUrl('')
+      } else {
+        if (!file) throw new Error('Choose a file to upload')
+        await onUploadMaterial(session.id, materialTitle, file)
+        setFile(null)
+      }
+      setTitle('')
+    } catch (submitError) {
+      setError(submitError.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <details className="session-material-editor">
+    <summary><Plus size={14} /> แนบเนื้อหา</summary>
+    <form onSubmit={submit}>
+      <label>ประเภท<select value={type} onChange={(event) => { setType(event.target.value); setFile(null) }}><option value="text">ข้อความ</option><option value="link">ลิงก์</option><option value="image">รูปภาพ</option><option value="slide">สไลด์ / PDF</option></select></label>
+      <label>หัวข้อ<input value={title} onChange={(event) => setTitle(event.target.value)} required maxLength="160" /></label>
+      {type === 'text' && <label>ข้อความ<textarea value={text} onChange={(event) => setText(event.target.value)} required maxLength="20000" rows={4} /></label>}
+      {type === 'link' && <label>ลิงก์ HTTPS<input type="url" value={url} onChange={(event) => setUrl(event.target.value)} required placeholder="https://" /></label>}
+      {['image', 'slide'].includes(type) && <label>ไฟล์<input type="file" accept={type === 'image' ? 'image/*' : '.pdf,.ppt,.pptx,application/pdf,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation'} onChange={(event) => setFile(event.target.files?.[0] || null)} required /></label>}
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <button className="outline-button" type="submit" disabled={busy}>{busy ? 'กำลังบันทึก…' : 'บันทึกเนื้อหา'}</button>
+    </form>
+  </details>
+}
+
 function AuthScreen({ mode, initialized, error, busy, inviteCode = '', onSubmit, onModeChange }) {
   const isSetup = mode === 'setup'
   const isJoin = mode === 'join'
-  const title = isSetup ? 'Create your workspace' : isJoin ? 'Join your team' : 'Welcome back'
+  const isReset = mode === 'reset'
+  const isStudentSignup = mode === 'studentSignup'
+  const title = isSetup ? 'Create your workspace' : isJoin ? 'Join your team' : isReset ? 'Set a new password' : isStudentSignup ? 'Create student account' : 'Welcome back'
   const description = isSetup
     ? 'Set up the first administrator account for your independent Attendance workspace'
     : isJoin
       ? 'Use the invite code from your workspace administrator to create your account'
-      : 'Sign in to access your team’s shared attendance records'
+      : isReset
+        ? 'Choose a new password for your student account'
+        : isStudentSignup
+          ? 'Create an account. Your classes will appear after an administrator enrolls you.'
+        : 'Sign in to access your team’s shared attendance records'
 
   return <main className="login-page">
     <section className="login-art"><div className="login-orbit orbit-one" /><div className="login-orbit orbit-two" />
@@ -1137,19 +1412,22 @@ function AuthScreen({ mode, initialized, error, busy, inviteCode = '', onSubmit,
     </div></section>
     <section className="login-panel"><div className="login-form-wrap">
       <div className="mobile-brand"><span className="brand-mark"><Check size={17} strokeWidth={3} /></span><strong>Attendance<span>Flow</span></strong></div>
-      <p className="eyebrow">{isSetup ? 'First-time setup' : isJoin ? 'Team invitation' : 'Secure workspace'}</p><h2>{title}</h2><p className="login-muted">{description}</p>
+      <p className="eyebrow">{isSetup ? 'First-time setup' : isJoin ? 'Team invitation' : isReset ? 'Password reset' : isStudentSignup ? 'Student registration' : 'Secure workspace'}</p><h2>{title}</h2><p className="login-muted">{description}</p>
       <form onSubmit={onSubmit}>
         {isSetup && <label>One-time setup code<input name="setupCode" required autoComplete="one-time-code" maxLength="128" /></label>}
         {isJoin && <label>Invitation code<input name="inviteCode" required autoComplete="one-time-code" maxLength="128" defaultValue={inviteCode} /></label>}
-        {(isSetup || isJoin) && <label>Your name<input name="name" required autoComplete="name" maxLength="160" /></label>}
-        <label>{isSetup || isJoin ? 'Email address' : 'Email address or account ID'}<input name="email" type={isSetup || isJoin ? 'email' : 'text'} required autoComplete={isSetup || isJoin ? 'email' : 'username'} maxLength="160" /></label>
-        <label>Password<input name="password" type="password" required autoComplete={isJoin || isSetup ? 'new-password' : 'current-password'} minLength={isSetup || isJoin ? 12 : undefined} maxLength="128" /></label>
+        {(isSetup || isJoin || isStudentSignup) && <label>Your name<input name="name" required autoComplete="name" maxLength="160" /></label>}
+        {isStudentSignup && <label>Student ID<input name="studentCode" required maxLength="100" autoComplete="off" /></label>}
+        {!isReset && <label>{isSetup || isJoin || isStudentSignup ? 'Email address' : 'Email address or account ID'}<input name="email" type={isSetup || isJoin || isStudentSignup ? 'email' : 'text'} required autoComplete={isSetup || isJoin || isStudentSignup ? 'email' : 'username'} maxLength="160" /></label>}
+        <label>{isReset ? 'New password' : 'Password'}<input name="password" type="password" required autoComplete={isJoin || isSetup || isReset || isStudentSignup ? 'new-password' : 'current-password'} minLength={isSetup || isJoin || isReset || isStudentSignup ? 12 : undefined} maxLength="128" /></label>
         {error && <p className="auth-error" role="alert">{error}</p>}
-        <button className="primary-button login-button" type="submit" disabled={busy}>{busy ? 'Please wait...' : isSetup ? 'Create workspace' : isJoin ? 'Join workspace' : 'Sign in'}</button>
+        <button className="primary-button login-button" type="submit" disabled={busy}>{busy ? 'Please wait...' : isSetup ? 'Create workspace' : isJoin ? 'Join workspace' : isReset ? 'Set new password' : 'Sign in'}</button>
       </form>
-      {!isSetup && <button className="demo-button" type="button" onClick={() => onModeChange(isJoin ? 'login' : initialized ? 'join' : 'setup')}>
+      {!isSetup && !isReset && !isStudentSignup && <button className="demo-button" type="button" onClick={() => onModeChange(isJoin ? 'login' : initialized ? 'join' : 'setup')}>
         {isJoin ? 'Back to sign in' : initialized ? 'Have a team invite? Join workspace' : 'First time here? Set up workspace'}
       </button>}
+      {!isSetup && !isReset && !isStudentSignup && initialized && <button className="demo-button" type="button" onClick={() => onModeChange('studentSignup')}>Create student account</button>}
+      {isStudentSignup && <button className="demo-button" type="button" onClick={() => onModeChange('login')}>Back to sign in</button>}
       {isSetup && <button className="demo-button" type="button" onClick={() => onModeChange('login')}>Back to sign in</button>}
       <p className="login-footnote">Private shared data · No connection to Enrollment</p>
     </div></section>
@@ -1282,6 +1560,72 @@ function AttendanceView({ sessions, selectedSession, roster, students, counts, s
     <RosterTable students={roster} onSetStatus={onSetStatus} disabled={selectedSession.status === 'closed'} />
     {!roster.length && <div className="empty-state"><Search size={22} /><strong>No students found</strong><span>Try a different search or status filter</span></div>}
     <div className="table-footnote"><ShieldCheck size={15} /><span>{selectedSession.status === 'closed' ? 'Closed sessions are read-only unless you reopen them' : 'Unmarked students are not automatically counted absent. Close the session to mark them absent'}</span></div>
+  </section>
+}
+
+function ClassesView({ classes, students, registrations, error, busy, onEnroll }) {
+  const [classId, setClassId] = useState(classes[0]?.id || '')
+  const [selectedIds, setSelectedIds] = useState([])
+  const classroom = classes.find((item) => item.id === classId)
+  const members = classroom?.studentIds || []
+  const options = [
+    ...students.filter((student) => !members.includes(student.id)).map((student) => ({
+      id: student.id,
+      name: student.name,
+      code: student.code,
+      email: student.email || 'ไม่มีอีเมล',
+      pending: false,
+    })),
+    ...registrations.map((student) => ({
+      id: student.id,
+      name: student.name,
+      code: student.studentCode,
+      email: student.email,
+      pending: true,
+    })),
+  ]
+  const allSelected = options.length > 0 && options.every((student) => selectedIds.includes(student.id))
+
+  function changeClass(nextClassId) {
+    setClassId(nextClassId)
+    setSelectedIds([])
+  }
+
+  function toggleAll() {
+    setSelectedIds(allSelected ? [] : options.map((student) => student.id))
+  }
+
+  function toggleStudent(studentId) {
+    setSelectedIds((current) => current.includes(studentId)
+      ? current.filter((id) => id !== studentId)
+      : [...current, studentId])
+  }
+
+  async function submit(event) {
+    event.preventDefault()
+    if (classroom && selectedIds.length && await onEnroll(classroom.id, selectedIds)) setSelectedIds([])
+  }
+
+  return <section className="panel students-panel">
+    <div className="panel-heading"><div><p className="eyebrow">CLASS ROSTERS</p><h2>Enroll students</h2><p className="panel-subtitle">Student accounts stay on an empty schedule until enrolled in a class</p></div></div>
+    <label className="filter-field"><span>Class</span><select value={classId} onChange={(event) => changeClass(event.target.value)}><option value="">Select a class</option>{classes.map((item) => <option key={item.id} value={item.id}>{item.courseCode} · {item.courseName}</option>)}</select></label>
+    {!classes.length && <div className="portal-empty"><strong>No classes yet</strong><span>A professor needs to create a class before students can be enrolled</span><a className="text-button" href="/professor">Open Professor view</a></div>}
+    {classroom && <>
+      <div className="roster-toolbar"><span>{members.length} students enrolled</span><span>{registrations.length} pending student accounts</span></div>
+      <form onSubmit={submit}>
+        {options.length > 0 ? <div className="student-directory class-enrollment-list">
+          <label className="directory-row enrollment-row"><span className="student-cell enrollment-student"><input aria-label="Select all available students" type="checkbox" checked={allSelected} onChange={toggleAll} /><strong>Select all available students</strong></span><span /><span /><span /></label>
+          {options.map((student) => <label className="directory-row enrollment-row" key={student.id}>
+            <span className="student-cell enrollment-student"><input aria-label={`Select ${student.name}`} type="checkbox" checked={selectedIds.includes(student.id)} onChange={() => toggleStudent(student.id)} /><strong>{student.name}</strong></span>
+            <span className="directory-code">{student.code}</span>
+            <span className="directory-email">{student.email}</span>
+            <StatusBadge status={student.pending ? 'upcoming' : 'present'} label={student.pending ? 'รอจัดชั้นเรียน' : 'ในระบบ'} />
+          </label>)}
+        </div> : <div className="empty-state"><strong>All available students are enrolled</strong><span>New student registrations will appear here</span></div>}
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <div className="backup-actions"><button className="primary-button" type="submit" disabled={busy || !selectedIds.length}>{busy ? 'Adding students…' : `Add ${selectedIds.length || ''} to class`}</button></div>
+      </form>
+    </>}
   </section>
 }
 
