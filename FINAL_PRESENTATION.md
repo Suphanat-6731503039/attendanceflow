@@ -1,9 +1,9 @@
 # AttendanceFlow — Final Project Presentation
 
-> **SE MFU · 2026 PlatformDev · Mini Project Final Presentation**  
-> **Project:** AttendanceFlow — Class Attendance and Enrollment Integration  
-> **Deployment:** [attendanceflow.pages.dev](https://attendanceflow.pages.dev)  
-> **Presentation date:** 10 November 2026  
+> **SE MFU · 2026 PlatformDev · Mini Project Final Presentation**<br>
+> **Project:** AttendanceFlow — Class Attendance and Enrollment Integration<br>
+> **Deployment:** [attendanceflow.pages.dev](https://attendanceflow.pages.dev)<br>
+> **Presentation date:** 10 November 2026<br>
 > **Team:** Team 07 Attendance
 
 This document maps the project to all eight final-presentation requirements. It describes the deployed system and distinguishes implemented features from integrations that still need partner-side verification.
@@ -204,4 +204,3 @@ For the final evaluation, demonstrate a complete path: class schedule → studen
 2. Re-test `GET /api/partner/enrollments` and complete a roster sync into a class.
 3. Re-run signed enrollment-webhook and attendance-delivery tests with the partner and retain sanitized evidence.
 4. Agree on retention, deletion, backup, and data-subject request procedures with the institution before broader deployment.
-
