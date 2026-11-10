@@ -1,0 +1,132 @@
+{
+  "info": {
+    "name": "A5 Team 05 - Enrollment Integration Tests",
+    "description": "Postman tests for Team 05 proxying the UniEnroll Team 03 API. Partner secrets stay in Cloudflare and are never stored in this collection.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://attendanceflow-webhook.6731503026.workers.dev"
+    },
+    {
+      "key": "courseCode",
+      "value": "CS101"
+    },
+    {
+      "key": "sectionNumber",
+      "value": "SEC01"
+    },
+    {
+      "key": "studentCode",
+      "value": "65010042"
+    }
+  ],
+  "item": [
+    {
+      "name": "1 - Active enrollment roster - 200 OK",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/enrollments?course_code={{courseCode}}&section_number={{sectionNumber}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "enrollments"],
+          "query": [
+            { "key": "course_code", "value": "{{courseCode}}" },
+            { "key": "section_number", "value": "{{sectionNumber}}" }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+              "const body = pm.response.json();",
+              "pm.test('Response is successful', function () { pm.expect(body.success).to.eql(true); });",
+              "pm.test('Provider is Team 03', function () { pm.expect(body.provider).to.eql('UniEnroll Team 03'); });",
+              "pm.test('Roster contains at least one student', function () { pm.expect(body.data).to.be.an('array').that.is.not.empty; });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "2 - Student enrollment lookup - 200 OK",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/enrollments?student_code={{studentCode}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "enrollments"],
+          "query": [
+            { "key": "student_code", "value": "{{studentCode}}" }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+              "const body = pm.response.json();",
+              "pm.test('Student exists in response', function () { pm.expect(body.data).to.be.an('array').that.is.not.empty; });",
+              "pm.test('Student code matches', function () { pm.expect(body.data[0].student_code).to.eql(pm.collectionVariables.get('studentCode')); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "3 - Unknown course and section - no results",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/enrollments?course_code=UNKNOWN&section_number=SEC99",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "enrollments"],
+          "query": [
+            { "key": "course_code", "value": "UNKNOWN" },
+            { "key": "section_number", "value": "SEC99" }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status is successful or not found', function () { pm.expect([200, 404]).to.include(pm.response.code); });",
+              "const body = pm.response.json();",
+              "pm.test('Response is JSON', function () { pm.expect(body).to.be.an('object'); });",
+              "if (pm.response.code === 200) pm.test('No matching records', function () { pm.expect(body.data).to.be.an('array').that.is.empty; });"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
