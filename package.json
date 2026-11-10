@@ -1,0 +1,24 @@
+{
+  "name": "attendanceflow",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "pages:dev": "npm run build && wrangler pages dev dist",
+    "pages:deploy": "npm run build && wrangler pages deploy dist --project-name attendanceflow --branch main",
+    "integrations:deploy": "wrangler deploy --config wrangler.integration.toml"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "wrangler": "^4.159.0"
+  }
+}

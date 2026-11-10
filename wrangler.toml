@@ -1,0 +1,9 @@
+name = "attendanceflow"
+compatibility_date = "2026-11-09"
+pages_build_output_dir = "./dist"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "attendanceflow-app"
+database_id = "3eabf5d5-1412-4dd3-966d-1e220e2d49ef"
+migrations_dir = "migrations"

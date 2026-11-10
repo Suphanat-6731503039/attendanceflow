@@ -1,0 +1,11 @@
+node_modules
+dist
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+evidence/
+pic/
+A5-Team07_Attendance-Integration-Evidence.md
+A5-Team05-Enrollment-Tests.postman_collection.json
+.wrangler
